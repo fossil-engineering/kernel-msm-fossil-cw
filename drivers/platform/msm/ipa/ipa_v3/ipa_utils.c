@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2020, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2021, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -7499,7 +7499,7 @@ int ipa3_bind_api_controller(enum ipa_hw_type ipa_hw_type,
 	api_ctrl->ipa_eth_aqc_disconnect = ipa3_eth_aqc_disconnect;
 	api_ctrl->ipa_eth_emac_disconnect = ipa3_eth_emac_disconnect;
 	api_ctrl->ipa_eth_client_conn_evt = ipa3_eth_client_conn_evt;
-	api_ctrl->ipa_eth_client_disconn_evt = ipa3_eth_client_conn_evt;
+	api_ctrl->ipa_eth_client_disconn_evt = ipa3_eth_client_disconn_evt;
 	return 0;
 }
 
@@ -9920,4 +9920,21 @@ void ipa3_eth_get_status(u32 client, int scratch_id,
 	stats->wp = gsi_get_refetch_reg(ch_id, false);
 	stats->err = gsi_get_drop_stats(ipa_ep_idx, scratch_id);
 	IPA_ACTIVE_CLIENTS_DEC_SIMPLE();
+}
+
+bool ipa3_is_modem_up(void)
+{
+	bool is_up;
+
+	mutex_lock(&ipa3_ctx->lock);
+	is_up = ipa3_ctx->is_modem_up;
+	mutex_unlock(&ipa3_ctx->lock);
+	return is_up;
+}
+
+void ipa3_set_modem_up(bool is_up)
+{
+	mutex_lock(&ipa3_ctx->lock);
+	ipa3_ctx->is_modem_up = is_up;
+	mutex_unlock(&ipa3_ctx->lock);
 }

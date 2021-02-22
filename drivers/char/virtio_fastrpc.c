@@ -1,4 +1,4 @@
-/* Copyright (c) 2020, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -48,10 +48,12 @@
 
 #define NUM_CHANNELS			4 /* adsp, mdsp, slpi, cdsp*/
 #define NUM_DEVICES			2 /* adsprpc-smd, adsprpc-smd-secure */
+#define M_FDLIST			16
 #define MINOR_NUM_DEV			0
 #define MINOR_NUM_SECURE_DEV		1
 #define ADSP_MMAP_HEAP_ADDR		4
 #define ADSP_MMAP_REMOTE_HEAP_ADDR	8
+#define FASTRPC_DMAHANDLE_NOMAP		16
 #define ADSP_MMAP_ADD_PAGES		0x1000
 
 #define INIT_FILELEN_MAX		(2*1024*1024)
@@ -160,6 +162,11 @@ struct virt_fastrpc_buf {
 	u64 len;	/* buffer length */
 };
 
+struct virt_fastrpc_dmahandle {
+	u32 fd;
+	u32 offset;
+};
+
 struct virt_invoke_msg {
 	struct virt_msg_hdr hdr;	/* virtio fastrpc message header */
 	u32 handle;			/* remote handle */
@@ -183,10 +190,17 @@ struct virt_munmap_msg {
 	u64 size;			/* mmap length */
 } __packed;
 
+
+struct virt_fastrpc_vq {
+	/* protects vq */
+	spinlock_t vq_lock;
+	struct virtqueue *vq;
+};
+
 struct fastrpc_apps {
 	struct virtio_device *vdev;
-	struct virtqueue *rvq;
-	struct virtqueue *svq;
+	struct virt_fastrpc_vq rvq;
+	struct virt_fastrpc_vq svq;
 	void *rbufs;
 	void *sbufs;
 	unsigned int order;
@@ -194,7 +208,6 @@ struct fastrpc_apps {
 	unsigned int buf_size;
 	int last_sbuf;
 
-	struct mutex lock;
 	bool has_invoke_attr;
 	bool has_invoke_crc;
 	bool has_mmap;
@@ -272,6 +285,7 @@ struct fastrpc_mmap {
 	uintptr_t va;
 	size_t len;
 	uintptr_t raddr;
+	int refs;
 };
 
 struct fastrpc_buf {
@@ -357,14 +371,22 @@ bail:
 	return val;
 }
 
+static void virt_init_vq(struct virt_fastrpc_vq *fastrpc_vq,
+				struct virtqueue *vq)
+{
+	spin_lock_init(&fastrpc_vq->vq_lock);
+	fastrpc_vq->vq = vq;
+}
+
 static void *get_a_tx_buf(void)
 {
 	struct fastrpc_apps *me = &gfa;
 	unsigned int len;
 	void *ret;
+	unsigned long flags;
 
 	/* support multiple concurrent senders */
-	mutex_lock(&me->lock);
+	spin_lock_irqsave(&me->svq.vq_lock, flags);
 	/*
 	 * either pick the next unused tx buffer
 	 * (half of our buffers are used for sending messages)
@@ -373,8 +395,8 @@ static void *get_a_tx_buf(void)
 		ret = me->sbufs + me->buf_size * me->last_sbuf++;
 	/* or recycle a used one */
 	else
-		ret = virtqueue_get_buf(me->svq, &len);
-	mutex_unlock(&me->lock);
+		ret = virtqueue_get_buf(me->svq.vq, &len);
+	spin_unlock_irqrestore(&me->svq.vq_lock, flags);
 	return ret;
 }
 
@@ -452,18 +474,24 @@ static void fastrpc_mmap_add(struct fastrpc_mmap *map)
 	}
 }
 
-static void fastrpc_mmap_free(struct fastrpc_mmap *map)
+static void fastrpc_mmap_free(struct fastrpc_mmap *map, uint32_t flags)
 {
 	struct fastrpc_apps *me = &gfa;
 
 	if (!map)
 		return;
+
 	if (map->flags == ADSP_MMAP_HEAP_ADDR ||
-				map->flags == ADSP_MMAP_REMOTE_HEAP_ADDR)
+				map->flags == ADSP_MMAP_REMOTE_HEAP_ADDR) {
 		dev_err(me->dev, "%s ADSP_MMAP_HEAP_ADDR is not supported\n",
 				__func__);
-	hlist_del_init(&map->hn);
-
+	} else {
+		map->refs--;
+		if (!map->refs)
+			hlist_del_init(&map->hn);
+		if (map->refs > 0 && !flags)
+			return;
+	}
 	if (!IS_ERR_OR_NULL(map->table))
 		dma_buf_unmap_attachment(map->attach, map->table,
 				DMA_BIDIRECTIONAL);
@@ -476,7 +504,7 @@ static void fastrpc_mmap_free(struct fastrpc_mmap *map)
 }
 
 static int fastrpc_mmap_find(struct fastrpc_file *fl, int fd,
-		uintptr_t va, size_t len, int mflags,
+		uintptr_t va, size_t len, int mflags, int refs,
 		struct fastrpc_mmap **ppmap)
 {
 	struct fastrpc_apps *me = &gfa;
@@ -491,9 +519,14 @@ static int fastrpc_mmap_find(struct fastrpc_file *fl, int fd,
 				__func__);
 	} else {
 		hlist_for_each_entry_safe(map, n, &fl->maps, hn) {
-			if (va == map->va &&
-				len == map->len &&
+			if (va >= map->va &&
+				va + len <= map->va + map->len &&
 				map->fd == fd) {
+				if (refs) {
+					if (map->refs + 1 == INT_MAX)
+						return -ETOOMANYREFS;
+					map->refs++;
+				}
 				match = map;
 				break;
 			}
@@ -536,6 +569,9 @@ static int fastrpc_mmap_create(struct fastrpc_file *fl, int fd,
 	unsigned long flags;
 	struct scatterlist *sgl = NULL;
 
+	if (!fastrpc_mmap_find(fl, fd, va, len, mflags, 1, ppmap))
+		return 0;
+
 	map = kzalloc(sizeof(*map), GFP_KERNEL);
 	VERIFY(err, !IS_ERR_OR_NULL(map));
 	if (err)
@@ -543,6 +579,7 @@ static int fastrpc_mmap_create(struct fastrpc_file *fl, int fd,
 
 	INIT_HLIST_NODE(&map->hn);
 	map->flags = mflags;
+	map->refs = 1;
 	map->fl = fl;
 	map->fd = fd;
 	if (mflags == ADSP_MMAP_HEAP_ADDR ||
@@ -590,7 +627,7 @@ static int fastrpc_mmap_create(struct fastrpc_file *fl, int fd,
 	*ppmap = map;
 bail:
 	if (err && map)
-		fastrpc_mmap_free(map);
+		fastrpc_mmap_free(map, 0);
 	return err;
 }
 
@@ -604,44 +641,59 @@ static int virt_fastrpc_invoke(struct fastrpc_file *fl, uint32_t kernel,
 	struct scatterlist sg[1];
 	int inbufs = REMOTE_SCALARS_INBUFS(invoke->sc);
 	int outbufs = REMOTE_SCALARS_OUTBUFS(invoke->sc);
-	int i, err, bufs;
+	int i, err = 0, bufs, handles, total;
 	remote_arg_t *lpra = NULL;
 	struct virt_fastrpc_buf *rpra;
+	struct virt_fastrpc_dmahandle *handle;
+	uint64_t *fdlist;
 	int *fds, outbufs_offset = 0;
-	struct fastrpc_mmap **maps;
-	size_t copylen = 0, size = 0;
+	unsigned int *attrs;
+	struct fastrpc_mmap **maps, *mmap = NULL;
+	size_t copylen = 0, size = 0, handle_len = 0, metalen;
 	char *payload;
 	struct fastrpc_buf_desc *desc = NULL;
 	struct timespec invoket = {0};
 	int64_t *perf_counter = getperfcounter(fl, PERF_COUNT);
+	unsigned long flags;
 
 	if (fl->profile)
 		getnstimeofday(&invoket);
 
-	bufs = REMOTE_SCALARS_LENGTH(invoke->sc);
-	size = bufs * sizeof(*lpra) + bufs * sizeof(*fds)
-		+ bufs * sizeof(*maps);
+	bufs = inbufs + outbufs;
+	handles = REMOTE_SCALARS_INHANDLES(invoke->sc)
+		+ REMOTE_SCALARS_OUTHANDLES(invoke->sc);
+	total = REMOTE_SCALARS_LENGTH(invoke->sc);
+	size = total * sizeof(*lpra) + total * sizeof(*fds)
+		+ total * sizeof(*attrs) + total * sizeof(*maps);
 	lpra = kzalloc(size, GFP_KERNEL);
 	if (!lpra)
 		return -ENOMEM;
-	fds = (int *)&lpra[bufs];
-	maps = (struct fastrpc_mmap **)&fds[bufs];
+	fds = (int *)&lpra[total];
+	attrs = (unsigned int *)&fds[total];
+	maps = (struct fastrpc_mmap **)&attrs[total];
 	K_COPY_FROM_USER(err, kernel, (void *)lpra, invoke->pra,
-			bufs * sizeof(*lpra));
+			total * sizeof(*lpra));
 	if (err)
 		goto bail;
 	if (inv->fds) {
 		K_COPY_FROM_USER(err, kernel, fds, inv->fds,
-				bufs * sizeof(*fds));
+				total * sizeof(*fds));
 		if (err)
 			goto bail;
 	} else {
 		fds = NULL;
 	}
 
+	if (inv->attrs) {
+		K_COPY_FROM_USER(err, kernel, attrs, inv->attrs,
+				total * sizeof(*attrs));
+		if (err)
+			goto bail;
+	}
+
 	PERF(fl->profile, GET_COUNTER(perf_counter, PERF_MAP),
 	/* calculate len required for copying */
-	for (i = 0; i < inbufs + outbufs; i++) {
+	for (i = 0; i < bufs; i++) {
 		size_t len = lpra[i].buf.len;
 
 		if (!len)
@@ -663,19 +715,42 @@ static int virt_fastrpc_invoke(struct fastrpc_file *fl, uint32_t kernel,
 			outbufs_offset += len;
 	}
 	PERF_END);
-	size = bufs * sizeof(*rpra) + copylen + sizeof(*vmsg);
+
+	mutex_lock(&fl->map_mutex);
+	for (i = bufs; i < total; i++) {
+		int dmaflags = 0;
+
+		if (attrs && (attrs[i] & FASTRPC_ATTR_NOMAP))
+			dmaflags = FASTRPC_DMAHANDLE_NOMAP;
+		if (fds && (fds[i] != -1)) {
+			err = fastrpc_mmap_create(fl, fds[i],
+					0, 0, dmaflags, &maps[i]);
+			if (err) {
+				mutex_unlock(&fl->map_mutex);
+				goto bail;
+			}
+			handle_len += maps[i]->table->nents *
+					sizeof(struct virt_fastrpc_buf);
+		}
+	}
+	mutex_unlock(&fl->map_mutex);
+
+	metalen = sizeof(*vmsg) + total * sizeof(*rpra)
+		+ handles * sizeof(struct virt_fastrpc_dmahandle)
+		+ sizeof(uint64_t) * M_FDLIST;
+	size = metalen + copylen + handle_len;
 	if (size > me->buf_size) {
 		/* if user buffer contents exceed virtio buffer limits,
 		 * try to alloc an internal buffer to copy
 		 */
 		copylen = 0;
 		outbufs_offset = 0;
-		desc = kzalloc(sizeof(*desc) * (inbufs + outbufs), GFP_KERNEL);
+		desc = kcalloc(bufs, sizeof(*desc), GFP_KERNEL);
 		if (!desc) {
 			err = -ENOMEM;
 			goto bail;
 		}
-		for (i = 0; i < inbufs + outbufs; i++) {
+		for (i = 0; i < bufs; i++) {
 			size_t len = lpra[i].buf.len;
 
 			if (maps[i]) {
@@ -698,7 +773,7 @@ static int virt_fastrpc_invoke(struct fastrpc_file *fl, uint32_t kernel,
 			if (i < inbufs)
 				outbufs_offset += len;
 		}
-		size = bufs * sizeof(*rpra) + copylen + sizeof(*vmsg);
+		size = metalen + copylen + handle_len;
 	}
 
 	msg = virt_alloc_msg(size);
@@ -721,10 +796,15 @@ static int virt_fastrpc_invoke(struct fastrpc_file *fl, uint32_t kernel,
 	vmsg->handle = invoke->handle;
 	vmsg->sc = invoke->sc;
 	rpra = (struct virt_fastrpc_buf *)vmsg->pra;
-	payload = (char *)&rpra[bufs];
+	handle = (struct virt_fastrpc_dmahandle *)&rpra[total];
+	fdlist = (uint64_t *)&handle[handles];
+	payload = (char *)&fdlist[M_FDLIST];
+
+	for (i = 0; i < M_FDLIST; i++)
+		fdlist[i] = 0;
 
 	PERF(fl->profile, GET_COUNTER(perf_counter, PERF_COPY),
-	for (i = 0; i < inbufs + outbufs; i++) {
+	for (i = 0; i < bufs; i++) {
 		size_t len = lpra[i].buf.len;
 		struct sg_table *table;
 		struct virt_fastrpc_buf *sgbuf;
@@ -775,6 +855,31 @@ static int virt_fastrpc_invoke(struct fastrpc_file *fl, uint32_t kernel,
 	}
 	PERF_END);
 
+	for (i = bufs; i < total; i++) {
+		struct sg_table *table;
+		struct virt_fastrpc_buf *sgbuf;
+		struct scatterlist *sgl = NULL;
+		int index = 0, hlist;
+
+		if (maps[i]) {
+			/* fill in dma handle list */
+			hlist = i - bufs;
+			handle[hlist].fd = fds[i];
+			handle[hlist].offset = (u32)lpra[i].buf.pv;
+			/* copy dma handle sglist to data area */
+			table = maps[i]->table;
+			rpra[i].pv = lpra[i].buf.len;
+			rpra[i].len = table->nents *
+				sizeof(struct virt_fastrpc_buf);
+			sgbuf = (struct virt_fastrpc_buf *)payload;
+			for_each_sg(table->sgl, sgl, table->nents, index) {
+				sgbuf[index].pv = sg_dma_address(sgl);
+				sgbuf[index].len = sg_dma_len(sgl);
+			}
+			payload += rpra[i].len;
+		}
+	}
+
 	if (fl->profile) {
 		int64_t *count = GET_COUNTER(perf_counter, PERF_GETARGS);
 
@@ -785,15 +890,16 @@ static int virt_fastrpc_invoke(struct fastrpc_file *fl, uint32_t kernel,
 	PERF(fl->profile, GET_COUNTER(perf_counter, PERF_LINK),
 	sg_init_one(sg, vmsg, size);
 
-	mutex_lock(&me->lock);
-	err = virtqueue_add_outbuf(me->svq, sg, 1, vmsg, GFP_KERNEL);
+	spin_lock_irqsave(&me->svq.vq_lock, flags);
+	err = virtqueue_add_outbuf(me->svq.vq, sg, 1, vmsg, GFP_KERNEL);
 	if (err) {
 		dev_err(me->dev, "%s: fail to add output buffer\n", __func__);
+		spin_unlock_irqrestore(&me->svq.vq_lock, flags);
 		goto bail;
 	}
 
-	virtqueue_kick(me->svq);
-	mutex_unlock(&me->lock);
+	virtqueue_kick(me->svq.vq);
+	spin_unlock_irqrestore(&me->svq.vq_lock, flags);
 	PERF_END);
 
 	wait_for_completion(&msg->work);
@@ -804,13 +910,15 @@ static int virt_fastrpc_invoke(struct fastrpc_file *fl, uint32_t kernel,
 		goto bail;
 
 	rpra = (struct virt_fastrpc_buf *)rsp->pra;
-	payload = (char *)&rpra[bufs] + outbufs_offset;
+	handle = (struct virt_fastrpc_dmahandle *)&rpra[total];
+	fdlist = (uint64_t *)&handle[handles];
+	payload = (char *)&fdlist[M_FDLIST] + outbufs_offset;
 
 	PERF(fl->profile, GET_COUNTER(perf_counter, PERF_PUTARGS),
-	for (i = inbufs; i < inbufs + outbufs; i++) {
+	for (i = inbufs; i < bufs; i++) {
 		if (maps[i]) {
 			mutex_lock(&fl->map_mutex);
-			fastrpc_mmap_free(maps[i]);
+			fastrpc_mmap_free(maps[i], 0);
 			mutex_unlock(&fl->map_mutex);
 			maps[i] = NULL;
 		} else if (desc && desc[i].type == FASTRPC_BUF_TYPE_INTERNAL) {
@@ -831,22 +939,35 @@ bail:
 	if (rsp) {
 		sg_init_one(sg, rsp, me->buf_size);
 
+		spin_lock_irqsave(&me->rvq.vq_lock, flags);
 		/* add the buffer back to the remote processor's virtqueue */
-		if (virtqueue_add_inbuf(me->rvq, sg, 1, rsp, GFP_KERNEL))
+		if (virtqueue_add_inbuf(me->rvq.vq, sg, 1, rsp, GFP_KERNEL))
 			dev_err(me->dev,
 				"%s: fail to add input buffer\n", __func__);
 		else
-			virtqueue_kick(me->rvq);
+			virtqueue_kick(me->rvq.vq);
+		spin_unlock_irqrestore(&me->rvq.vq_lock, flags);
 	}
 
 	mutex_lock(&fl->map_mutex);
-	for (i = 0; i < inbufs + outbufs; i++)
-		fastrpc_mmap_free(maps[i]);
+	for (i = 0; i < bufs; i++)
+		fastrpc_mmap_free(maps[i], 0);
+
+	if (total) {
+		for (i = 0; i < M_FDLIST; i++) {
+			if (!fdlist[i])
+				break;
+			if (!fastrpc_mmap_find(fl, (int)fdlist[i], 0, 0,
+						0, 0, &mmap))
+				fastrpc_mmap_free(mmap, 0);
+		}
+	}
 	mutex_unlock(&fl->map_mutex);
+
 	if (msg)
 		virt_free_msg(msg);
 	if (desc) {
-		for (i = 0; i < inbufs + outbufs; i++) {
+		for (i = 0; i < bufs; i++) {
 			if (desc[i].buf)
 				fastrpc_buf_free(desc[i].buf, 1);
 		}
@@ -864,7 +985,7 @@ static int fastrpc_internal_invoke(struct fastrpc_file *fl,
 	struct fastrpc_ioctl_invoke *invoke = &inv->inv;
 	struct fastrpc_apps *me = fl->apps;
 	int domain = fl->domain;
-	int handles, err = 0;
+	int err = 0;
 	struct timespec invoket = {0};
 	int64_t *perf_counter = getperfcounter(fl, PERF_COUNT);
 
@@ -885,14 +1006,6 @@ static int fastrpc_internal_invoke(struct fastrpc_file *fl,
 		dev_err(me->dev, "user application %s domain is not set\n",
 				current->comm);
 		err = -EBADR;
-		goto bail;
-	}
-
-	handles = REMOTE_SCALARS_INHANDLES(invoke->sc) +
-			REMOTE_SCALARS_OUTHANDLES(invoke->sc);
-	if (handles) {
-		dev_err(me->dev, "dma handle is not supported\n");
-		err = -ENOTTY;
 		goto bail;
 	}
 
@@ -1289,7 +1402,7 @@ static int fastrpc_file_free(struct fastrpc_file *fl)
 			lmap = map;
 			break;
 		}
-		fastrpc_mmap_free(lmap);
+		fastrpc_mmap_free(lmap, 1);
 	} while (lmap);
 	mutex_unlock(&fl->map_mutex);
 
@@ -1362,6 +1475,7 @@ static int virt_fastrpc_munmap(struct fastrpc_file *fl, uintptr_t raddr,
 	struct virt_fastrpc_msg *msg;
 	struct scatterlist sg[1];
 	int err;
+	unsigned long flags;
 
 	msg = virt_alloc_msg(sizeof(*vmsg));
 	if (!msg)
@@ -1379,15 +1493,16 @@ static int virt_fastrpc_munmap(struct fastrpc_file *fl, uintptr_t raddr,
 	vmsg->size = size;
 	sg_init_one(sg, vmsg, sizeof(*vmsg));
 
-	mutex_lock(&me->lock);
-	err = virtqueue_add_outbuf(me->svq, sg, 1, vmsg, GFP_KERNEL);
+	spin_lock_irqsave(&me->svq.vq_lock, flags);
+	err = virtqueue_add_outbuf(me->svq.vq, sg, 1, vmsg, GFP_KERNEL);
 	if (err) {
 		dev_err(me->dev, "%s: fail to add output buffer\n", __func__);
+		spin_unlock_irqrestore(&me->svq.vq_lock, flags);
 		goto bail;
 	}
 
-	virtqueue_kick(me->svq);
-	mutex_unlock(&me->lock);
+	virtqueue_kick(me->svq.vq);
+	spin_unlock_irqrestore(&me->svq.vq_lock, flags);
 
 	wait_for_completion(&msg->work);
 
@@ -1397,12 +1512,14 @@ bail:
 	if (rsp) {
 		sg_init_one(sg, rsp, me->buf_size);
 
+		spin_lock_irqsave(&me->rvq.vq_lock, flags);
 		/* add the buffer back to the remote processor's virtqueue */
-		if (virtqueue_add_inbuf(me->rvq, sg, 1, rsp, GFP_KERNEL))
+		if (virtqueue_add_inbuf(me->rvq.vq, sg, 1, rsp, GFP_KERNEL))
 			dev_err(me->dev,
 				"%s: fail to add input buffer\n", __func__);
 		else
-			virtqueue_kick(me->rvq);
+			virtqueue_kick(me->rvq.vq);
+		spin_unlock_irqrestore(&me->rvq.vq_lock, flags);
 	}
 	virt_free_msg(msg);
 
@@ -1458,7 +1575,7 @@ static int fastrpc_internal_munmap(struct fastrpc_file *fl,
 	if (err)
 		goto bail;
 	mutex_lock(&fl->map_mutex);
-	fastrpc_mmap_free(map);
+	fastrpc_mmap_free(map, 0);
 	mutex_unlock(&fl->map_mutex);
 bail:
 	if (err && map) {
@@ -1487,7 +1604,7 @@ static int fastrpc_internal_munmap_fd(struct fastrpc_file *fl,
 		goto bail;
 	}
 	mutex_lock(&fl->map_mutex);
-	if (fastrpc_mmap_find(fl, ud->fd, ud->va, ud->len, 0, &map)) {
+	if (fastrpc_mmap_find(fl, ud->fd, ud->va, ud->len, 0, 0, &map)) {
 		dev_err(me->dev, "mapping not found to unmap fd 0x%x, va 0x%lx, len 0x%x\n",
 			ud->fd, ud->va, (unsigned int)ud->len);
 		err = -1;
@@ -1495,7 +1612,7 @@ static int fastrpc_internal_munmap_fd(struct fastrpc_file *fl,
 		goto bail;
 	}
 	if (map)
-		fastrpc_mmap_free(map);
+		fastrpc_mmap_free(map, 0);
 	mutex_unlock(&fl->map_mutex);
 bail:
 	return err;
@@ -1513,6 +1630,7 @@ static int virt_fastrpc_mmap(struct fastrpc_file *fl, uint32_t flags,
 	int err, sgbuf_size, total_size;
 	struct scatterlist *sgl = NULL;
 	int sgl_index = 0;
+	unsigned long int_flags;
 
 	sgbuf_size = nents * sizeof(*sgbuf);
 	total_size = sizeof(*vmsg) + sgbuf_size;
@@ -1548,15 +1666,16 @@ static int virt_fastrpc_mmap(struct fastrpc_file *fl, uint32_t flags,
 
 	sg_init_one(sg, vmsg, total_size);
 
-	mutex_lock(&me->lock);
-	err = virtqueue_add_outbuf(me->svq, sg, 1, vmsg, GFP_KERNEL);
+	spin_lock_irqsave(&me->svq.vq_lock, int_flags);
+	err = virtqueue_add_outbuf(me->svq.vq, sg, 1, vmsg, GFP_KERNEL);
 	if (err) {
 		dev_err(me->dev, "%s: fail to add output buffer\n", __func__);
+		spin_unlock_irqrestore(&me->svq.vq_lock, int_flags);
 		goto bail;
 	}
 
-	virtqueue_kick(me->svq);
-	mutex_unlock(&me->lock);
+	virtqueue_kick(me->svq.vq);
+	spin_unlock_irqrestore(&me->svq.vq_lock, int_flags);
 
 	wait_for_completion(&msg->work);
 
@@ -1569,12 +1688,14 @@ bail:
 	if (rsp) {
 		sg_init_one(sg, rsp, me->buf_size);
 
+		spin_lock_irqsave(&me->rvq.vq_lock, int_flags);
 		/* add the buffer back to the remote processor's virtqueue */
-		if (virtqueue_add_inbuf(me->rvq, sg, 1, rsp, GFP_KERNEL))
+		if (virtqueue_add_inbuf(me->rvq.vq, sg, 1, rsp, GFP_KERNEL))
 			dev_err(me->dev,
 				"%s: fail to add input buffer\n", __func__);
 		else
-			virtqueue_kick(me->rvq);
+			virtqueue_kick(me->rvq.vq);
+		spin_unlock_irqrestore(&me->rvq.vq_lock, int_flags);
 	}
 	virt_free_msg(msg);
 
@@ -1643,7 +1764,7 @@ static int fastrpc_internal_mmap(struct fastrpc_file *fl,
  bail:
 	if (err && map) {
 		mutex_lock(&fl->map_mutex);
-		fastrpc_mmap_free(map);
+		fastrpc_mmap_free(map, 0);
 		mutex_unlock(&fl->map_mutex);
 	}
 	return err;
@@ -1657,6 +1778,7 @@ static int virt_fastrpc_control(struct fastrpc_file *fl,
 	struct virt_fastrpc_msg *msg;
 	struct scatterlist sg[1];
 	int err;
+	unsigned long flags;
 
 	msg = virt_alloc_msg(sizeof(*vmsg));
 	if (!msg)
@@ -1674,15 +1796,16 @@ static int virt_fastrpc_control(struct fastrpc_file *fl,
 	vmsg->latency = lp->level;
 	sg_init_one(sg, vmsg, sizeof(*vmsg));
 
-	mutex_lock(&me->lock);
-	err = virtqueue_add_outbuf(me->svq, sg, 1, vmsg, GFP_KERNEL);
+	spin_lock_irqsave(&me->svq.vq_lock, flags);
+	err = virtqueue_add_outbuf(me->svq.vq, sg, 1, vmsg, GFP_KERNEL);
 	if (err) {
 		dev_err(me->dev, "%s: fail to add output buffer\n", __func__);
+		spin_unlock_irqrestore(&me->svq.vq_lock, flags);
 		goto bail;
 	}
 
-	virtqueue_kick(me->svq);
-	mutex_unlock(&me->lock);
+	virtqueue_kick(me->svq.vq);
+	spin_unlock_irqrestore(&me->svq.vq_lock, flags);
 
 	wait_for_completion(&msg->work);
 
@@ -1692,12 +1815,14 @@ bail:
 	if (rsp) {
 		sg_init_one(sg, rsp, me->buf_size);
 
+		spin_lock_irqsave(&me->rvq.vq_lock, flags);
 		/* add the buffer back to the remote processor's virtqueue */
-		if (virtqueue_add_inbuf(me->rvq, sg, 1, rsp, GFP_KERNEL))
+		if (virtqueue_add_inbuf(me->rvq.vq, sg, 1, rsp, GFP_KERNEL))
 			dev_err(me->dev,
 				"%s: fail to add input buffer\n", __func__);
 		else
-			virtqueue_kick(me->rvq);
+			virtqueue_kick(me->rvq.vq);
+		spin_unlock_irqrestore(&me->rvq.vq_lock, flags);
 	}
 	virt_free_msg(msg);
 
@@ -1765,6 +1890,7 @@ static int virt_fastrpc_open(struct fastrpc_file *fl)
 	struct virt_fastrpc_msg *msg;
 	struct scatterlist sg[1];
 	int err;
+	unsigned long flags;
 
 	msg = virt_alloc_msg(sizeof(*vmsg));
 	if (!msg) {
@@ -1784,15 +1910,16 @@ static int virt_fastrpc_open(struct fastrpc_file *fl)
 	vmsg->pd = fl->pd;
 	sg_init_one(sg, vmsg, sizeof(*vmsg));
 
-	mutex_lock(&me->lock);
-	err = virtqueue_add_outbuf(me->svq, sg, 1, vmsg, GFP_KERNEL);
+	spin_lock_irqsave(&me->svq.vq_lock, flags);
+	err = virtqueue_add_outbuf(me->svq.vq, sg, 1, vmsg, GFP_KERNEL);
 	if (err) {
 		dev_err(me->dev, "%s: fail to add output buffer\n", __func__);
+		spin_unlock_irqrestore(&me->svq.vq_lock, flags);
 		goto bail;
 	}
 
-	virtqueue_kick(me->svq);
-	mutex_unlock(&me->lock);
+	virtqueue_kick(me->svq.vq);
+	spin_unlock_irqrestore(&me->svq.vq_lock, flags);
 
 	wait_for_completion(&msg->work);
 
@@ -1810,12 +1937,14 @@ bail:
 	if (rsp) {
 		sg_init_one(sg, rsp, me->buf_size);
 
+		spin_lock_irqsave(&me->rvq.vq_lock, flags);
 		/* add the buffer back to the remote processor's virtqueue */
-		if (virtqueue_add_inbuf(me->rvq, sg, 1, rsp, GFP_KERNEL))
+		if (virtqueue_add_inbuf(me->rvq.vq, sg, 1, rsp, GFP_KERNEL))
 			dev_err(me->dev,
 				"%s: fail to add input buffer\n", __func__);
 		else
-			virtqueue_kick(me->rvq);
+			virtqueue_kick(me->rvq.vq);
+		spin_unlock_irqrestore(&me->rvq.vq_lock, flags);
 	}
 	virt_free_msg(msg);
 
@@ -1829,6 +1958,7 @@ static int virt_fastrpc_close(struct fastrpc_file *fl)
 	struct virt_fastrpc_msg *msg;
 	struct scatterlist sg[1];
 	int err;
+	unsigned long flags;
 
 	if (fl->cid < 0) {
 		dev_err(me->dev, "channel id %d is invalid\n", fl->cid);
@@ -1851,15 +1981,16 @@ static int virt_fastrpc_close(struct fastrpc_file *fl)
 	vmsg->result = 0xffffffff;
 	sg_init_one(sg, vmsg, sizeof(*vmsg));
 
-	mutex_lock(&me->lock);
-	err = virtqueue_add_outbuf(me->svq, sg, 1, vmsg, GFP_KERNEL);
+	spin_lock_irqsave(&me->svq.vq_lock, flags);
+	err = virtqueue_add_outbuf(me->svq.vq, sg, 1, vmsg, GFP_KERNEL);
 	if (err) {
 		dev_err(me->dev, "%s: fail to add output buffer\n", __func__);
+		spin_unlock_irqrestore(&me->svq.vq_lock, flags);
 		goto bail;
 	}
 
-	virtqueue_kick(me->svq);
-	mutex_unlock(&me->lock);
+	virtqueue_kick(me->svq.vq);
+	spin_unlock_irqrestore(&me->svq.vq_lock, flags);
 
 	wait_for_completion(&msg->work);
 
@@ -1869,12 +2000,14 @@ bail:
 	if (rsp) {
 		sg_init_one(sg, rsp, me->buf_size);
 
+		spin_lock_irqsave(&me->rvq.vq_lock, flags);
 		/* add the buffer back to the remote processor's virtqueue */
-		if (virtqueue_add_inbuf(me->rvq, sg, 1, rsp, GFP_KERNEL))
+		if (virtqueue_add_inbuf(me->rvq.vq, sg, 1, rsp, GFP_KERNEL))
 			dev_err(me->dev,
 				"%s: fail to add input buffer\n", __func__);
 		else
-			virtqueue_kick(me->rvq);
+			virtqueue_kick(me->rvq.vq);
+		spin_unlock_irqrestore(&me->rvq.vq_lock, flags);
 	}
 	virt_free_msg(msg);
 
@@ -2190,7 +2323,6 @@ static const struct file_operations fops = {
 
 static void fastrpc_init(struct fastrpc_apps *me)
 {
-	mutex_init(&me->lock);
 	spin_lock_init(&me->msglock);
 }
 
@@ -2226,12 +2358,16 @@ static void recv_done(struct virtqueue *rvq)
 	struct virt_msg_hdr *rsp;
 	unsigned int len, msgs_received = 0;
 	int err;
+	unsigned long flags;
 
+	spin_lock_irqsave(&me->rvq.vq_lock, flags);
 	rsp = virtqueue_get_buf(rvq, &len);
 	if (!rsp) {
+		spin_unlock_irqrestore(&me->rvq.vq_lock, flags);
 		dev_err(me->dev, "incoming signal, but no used buffer\n");
 		return;
 	}
+	spin_unlock_irqrestore(&me->rvq.vq_lock, flags);
 
 	while (rsp) {
 		err = recv_single(rsp, len);
@@ -2240,7 +2376,9 @@ static void recv_done(struct virtqueue *rvq)
 
 		msgs_received++;
 
+		spin_lock_irqsave(&me->rvq.vq_lock, flags);
 		rsp = virtqueue_get_buf(rvq, &len);
+		spin_unlock_irqrestore(&me->rvq.vq_lock, flags);
 	}
 }
 
@@ -2257,13 +2395,13 @@ static int init_vqs(struct fastrpc_apps *me)
 	if (err)
 		return err;
 
-	me->svq = vqs[0];
-	me->rvq = vqs[1];
+	virt_init_vq(&me->svq, vqs[0]);
+	virt_init_vq(&me->rvq, vqs[1]);
 
 	/* we expect symmetric tx/rx vrings */
-	WARN_ON(virtqueue_get_vring_size(me->rvq) !=
-			virtqueue_get_vring_size(me->svq));
-	me->num_bufs = virtqueue_get_vring_size(me->rvq) * 2;
+	WARN_ON(virtqueue_get_vring_size(me->rvq.vq) !=
+			virtqueue_get_vring_size(me->svq.vq));
+	me->num_bufs = virtqueue_get_vring_size(me->rvq.vq) * 2;
 
 	me->buf_size = MAX_FASTRPC_BUF_SIZE;
 	total_buf_space = me->num_bufs * me->buf_size;
@@ -2362,16 +2500,16 @@ static int virt_fastrpc_probe(struct virtio_device *vdev)
 		void *cpu_addr = me->rbufs + i * me->buf_size;
 
 		sg_init_one(&sg, cpu_addr, me->buf_size);
-		err = virtqueue_add_inbuf(me->rvq, &sg, 1, cpu_addr,
+		err = virtqueue_add_inbuf(me->rvq.vq, &sg, 1, cpu_addr,
 				GFP_KERNEL);
 		WARN_ON(err); /* sanity check; this can't really happen */
 	}
 
 	/* suppress "tx-complete" interrupts */
-	virtqueue_disable_cb(me->svq);
+	virtqueue_disable_cb(me->svq.vq);
 
-	virtqueue_enable_cb(me->rvq);
-	virtqueue_kick(me->rvq);
+	virtqueue_enable_cb(me->rvq.vq);
+	virtqueue_kick(me->rvq.vq);
 
 	dev_info(&vdev->dev, "Registered virtio fastrpc device\n");
 

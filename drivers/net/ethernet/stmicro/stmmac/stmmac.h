@@ -83,6 +83,7 @@ struct stmmac_rx_queue {
 	struct napi_struct napi ____cacheline_aligned_in_smp;
 	bool skip_sw;
 	bool en_fep;
+	bool dis_mod;
 };
 
 struct stmmac_priv {
@@ -203,6 +204,8 @@ int stmmac_dvr_remove(struct device *dev);
 int stmmac_dvr_probe(struct device *device,
 		     struct plat_stmmacenet_data *plat_dat,
 		     struct stmmac_resources *res);
+void stmmac_tx_err(struct stmmac_priv *priv, u32 chan);
+void stmmac_tx_clean(struct stmmac_priv *priv, u32 queue);
 void stmmac_disable_eee_mode(struct stmmac_priv *priv);
 bool stmmac_eee_init(struct stmmac_priv *priv);
 bool qcom_ethqos_ipa_enabled(void);
