@@ -1,4 +1,4 @@
-/* Copyright (c) 2015-2020, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2015-2021, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -416,7 +416,7 @@ struct mhi_dev_ring {
 	/* ring_ctx_shadow -> tracking ring_ctx in the host */
 	union mhi_dev_ring_ctx			*ring_ctx_shadow;
 	struct msi_buf_cb_data		msi_buffer;
-	void (*ring_cb)(struct mhi_dev *dev,
+	int (*ring_cb)(struct mhi_dev *dev,
 			union mhi_dev_ring_element_type *el,
 			void *ctx);
 };
@@ -518,6 +518,8 @@ struct mhi_dev_channel {
 	uint32_t			msi_cnt;
 	uint32_t			flush_req_cnt;
 	bool				skip_td;
+	bool				db_pending;
+	bool				reset_pending;
 };
 
 /* Structure device for mhi dev */
@@ -782,7 +784,7 @@ int mhi_dev_add_element(struct mhi_dev_ring *ring,
  * @ring_cb:	callback function.
  */
 void mhi_ring_set_cb(struct mhi_dev_ring *ring,
-			void (*ring_cb)(struct mhi_dev *dev,
+			int (*ring_cb)(struct mhi_dev *dev,
 			union mhi_dev_ring_element_type *el, void *ctx));
 
 /**

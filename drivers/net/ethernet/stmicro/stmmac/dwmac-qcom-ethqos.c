@@ -39,6 +39,9 @@ static struct msm_bus_scale_pdata *emac_bus_scale_vec;
 #define PHY_LOOPBACK_100 0x6100
 #define PHY_LOOPBACK_10 0x4100
 
+#define DMA_TX_SIZE_CV2X 128
+#define DMA_RX_SIZE_CV2X 128
+
 static void __iomem *tlmm_central_base_addr;
 static void ethqos_rgmii_io_macro_loopback(struct qcom_ethqos *ethqos,
 					   int mode);
@@ -432,6 +435,13 @@ static int qcom_ethqos_add_ipaddr(struct ip_params *ip_info,
 
 	if (!net || !net->genl_sock || !net->genl_sock->sk_socket) {
 		ETHQOSERR("Sock is null, unable to assign ipv4 address\n");
+		return res;
+	}
+
+	if (!net->ipv4.devconf_dflt) {
+		ETHQOSERR("ipv4.devconf_dflt is null, schedule wq\n");
+		schedule_delayed_work(&pethqos->ipv4_addr_assign_wq,
+				      msecs_to_jiffies(1000));
 		return res;
 	}
 	/*For valid Ipv4 address*/
@@ -2764,10 +2774,7 @@ static void ethqos_set_early_eth_param(
 	if (pparams.is_valid_ipv4_addr) {
 		INIT_DELAYED_WORK(&ethqos->ipv4_addr_assign_wq,
 				  ethqos_is_ipv4_NW_stack_ready);
-		ret = qcom_ethqos_add_ipaddr(&pparams, priv->dev);
-		if (ret)
-			schedule_delayed_work(&ethqos->ipv4_addr_assign_wq,
-					      msecs_to_jiffies(1000));
+		schedule_delayed_work(&ethqos->ipv4_addr_assign_wq, 0);
 	}
 
 	if (pparams.is_valid_ipv6_addr) {
@@ -3489,20 +3496,43 @@ static int qcom_ethqos_probe(struct platform_device *pdev)
 		return PTR_ERR(plat_dat);
 	}
 
-	if (ethqos->cv2x_mode == CV2X_MODE_MDM ||
-	    ethqos->cv2x_mode == CV2X_MODE_AP) {
-		for (i = 0; i < plat_dat->rx_queues_to_use; i++) {
-			if (plat_dat->rx_queues_cfg[i].pkt_route ==
-			    PACKET_AVCPQ)
-				plat_dat->rx_queues_cfg[i].pkt_route = 0;
-		}
-	}
-
 	if (plat_dat->tx_sched_algorithm == MTL_TX_ALGORITHM_WFQ ||
 	    plat_dat->tx_sched_algorithm == MTL_TX_ALGORITHM_DWRR) {
 		ETHQOSERR("WFO and DWRR TX Algorithm is not supported\n");
 		ETHQOSDBG("Set TX Algorithm to default WRR\n");
 		plat_dat->tx_sched_algorithm = MTL_TX_ALGORITHM_WRR;
+	}
+
+	if (ethqos->cv2x_mode) {
+		if (ethqos->cv2x_vlan.rx_queue >= plat_dat->rx_queues_to_use)
+			ethqos->cv2x_vlan.rx_queue = CV2X_TAG_TX_CHANNEL;
+
+		ret = of_property_read_u32(np, "jumbo-mtu",
+					   &plat_dat->jumbo_mtu);
+		if (!ret) {
+			if (plat_dat->jumbo_mtu >
+			    MAX_SUPPORTED_JUMBO_MTU) {
+				ETHQOSDBG("jumbo mtu %u biger than max val\n",
+					  plat_dat->jumbo_mtu);
+				ETHQOSDBG("Set it to max supported value %u\n",
+					  MAX_SUPPORTED_JUMBO_MTU);
+				plat_dat->jumbo_mtu =
+					MAX_SUPPORTED_JUMBO_MTU;
+			}
+
+			if (plat_dat->jumbo_mtu < MIN_JUMBO_FRAME_SIZE) {
+				plat_dat->jumbo_mtu = 0;
+			} else {
+				/* Store and Forward mode will limit the max
+				 * buffer size per rx fifo buffer size
+				 * configuration. Use Receive Queue Threshold
+				 * Control mode (rtc) for cv2x rx queue to
+				 * support the jumbo frame up to 8K.
+				 */
+				i = ethqos->cv2x_vlan.rx_queue;
+				plat_dat->rx_queues_cfg[i].use_rtc = true;
+			}
+		}
 	}
 
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "rgmii");
@@ -3703,6 +3733,7 @@ static int qcom_ethqos_probe(struct platform_device *pdev)
 
 	ndev = dev_get_drvdata(&ethqos->pdev->dev);
 	priv = netdev_priv(ndev);
+	priv->clk_csr = STMMAC_CSR_100_150M;
 
 	if (pparams.is_valid_mac_addr) {
 		ether_addr_copy(dev_addr, pparams.mac_addr);
@@ -3719,12 +3750,36 @@ static int qcom_ethqos_probe(struct platform_device *pdev)
 		ethqos_set_early_eth_param(priv, ethqos);
 	}
 
-	if (ethqos->cv2x_mode) {
-		for (i = 0; i < plat_dat->rx_queues_to_use; i++) {
+	for (i = 0; i < plat_dat->tx_queues_to_use; i++) {
+		if (of_property_read_u32(np, "dma-tx-desc-cnt",
+					 &priv->tx_queue[i].dma_tx_desc_sz))
+			priv->tx_queue[i].dma_tx_desc_sz = DMA_TX_SIZE;
+
+		if (ethqos->cv2x_mode && i == ethqos->cv2x_vlan.rx_queue)
+			priv->tx_queue[i].dma_tx_desc_sz = DMA_TX_SIZE_CV2X;
+
+		ETHQOSDBG("TX queue[%u] desc cnt = %u\n",
+			  i, priv->tx_queue[i].dma_tx_desc_sz);
+	}
+
+	for (i = 0; i < plat_dat->rx_queues_to_use; i++) {
+		if (of_property_read_u32(np, "dma-rx-desc-cnt",
+					 &priv->rx_queue[i].dma_rx_desc_sz))
+			priv->rx_queue[i].dma_rx_desc_sz = DMA_RX_SIZE;
+
+		if (ethqos->cv2x_mode) {
 			priv->rx_queue[i].en_fep = true;
-			if (i == ethqos->cv2x_vlan.rx_queue)
+			if (i == ethqos->cv2x_vlan.rx_queue) {
 				priv->rx_queue[i].dis_mod = true;
+				if (plat_dat->jumbo_mtu)
+					priv->rx_queue[i].jumbo_en = true;
+				priv->rx_queue[i].dma_rx_desc_sz =
+					DMA_RX_SIZE_CV2X;
+			}
 		}
+
+		ETHQOSDBG("RX queue[%u] desc cnt = %u\n",
+			  i, priv->rx_queue[i].dma_rx_desc_sz);
 	}
 
 	if (ethqos->qoe_mode || ethqos->cv2x_mode) {
