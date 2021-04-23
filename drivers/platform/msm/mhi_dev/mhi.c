@@ -226,7 +226,11 @@ void mhi_dev_write_to_host_ipa(struct mhi_dev *mhi, struct mhi_addr *transfer,
 			cb_func = ereq->rd_offset_cb;
 		} else if (ereq->event_type == SEND_MSI) {
 			cb_func = ereq->msi_cb;
+		} else {
+			pr_err("Invalid event type : %d\n", ereq->event_type);
+			return;
 		}
+
 		rc = ipa_dma_async_memcpy(host_addr_pa, (uint64_t)dma,
 				(int)transfer->size,
 				cb_func, ereq);
@@ -3009,8 +3013,8 @@ static int mhi_dev_alloc_cmd_ack_buf_req(struct mhi_dev *mhi)
 						sizeof(*cmd_ctx->ereqs),
 						GFP_KERNEL);
 	if (!cmd_ctx->ereqs) {
+		rc = -ENOMEM;
 		goto free_ereqs;
-		return -ENOMEM;
 	}
 
 	mhi_log(MHI_MSG_INFO,
@@ -3047,15 +3051,16 @@ static int mhi_dev_alloc_cmd_ack_buf_req(struct mhi_dev *mhi)
 
 	return 0;
 free_ereqs:
-		kfree(mhi->cmd_ctx);
-		mhi_log(MHI_MSG_INFO,
-				"MEM_DEALLOC: size:%d CMD_CTX\n",
-				sizeof(struct mhi_cmd_cmpl_ctx));
 		kfree(cmd_ctx->ereqs);
 		mhi_log(MHI_MSG_INFO,
 			"MEM_DEALLOC: size:%d EREQ CMD\n",
 			NUM_CMD_EVENTS_DEFAULT);
 		cmd_ctx->ereqs = NULL;
+
+		kfree(mhi->cmd_ctx);
+		mhi_log(MHI_MSG_INFO,
+				"MEM_DEALLOC: size:%d CMD_CTX\n",
+				sizeof(struct mhi_cmd_cmpl_ctx));
 		mhi->cmd_ctx = NULL;
 		return rc;
 }
@@ -3530,6 +3535,8 @@ int mhi_dev_write_channel(struct mhi_req *wreq)
 	}
 
 	usr_buf_remaining =  wreq->len;
+	handle_client = wreq->client;
+	ch = handle_client->channel;
 	mutex_lock(&mhi_ctx->mhi_write_test);
 
 	if (atomic_read(&mhi_ctx->is_suspended)) {
@@ -3537,6 +3544,7 @@ int mhi_dev_write_channel(struct mhi_req *wreq)
 		 * Expected usage is when there is a write
 		 * to the MHI core -> notify SM.
 		 */
+		mhi_log(MHI_MSG_INFO, "Wakeup by chan:%d\n", ch->ch_id);
 		rc = mhi_dev_notify_sm_event(MHI_DEV_EVENT_CORE_WAKEUP);
 		if (rc) {
 			pr_err("error sending core wakeup event\n");
@@ -3559,8 +3567,6 @@ int mhi_dev_write_channel(struct mhi_req *wreq)
 		return -ENODEV;
 	}
 
-	handle_client = wreq->client;
-	ch = handle_client->channel;
 
 	ring = ch->ring;
 
