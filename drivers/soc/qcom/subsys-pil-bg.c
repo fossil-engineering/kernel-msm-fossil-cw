@@ -26,6 +26,7 @@
 #include <soc/qcom/ramdump.h>
 #include <soc/qcom/subsystem_notif.h>
 #include <linux/highmem.h>
+#include <linux/syscalls.h>
 
 #include "peripheral-loader.h"
 #include "../../misc/qseecom_kernel.h"
@@ -305,6 +306,10 @@ static int bg_powerup(const struct subsys_desc *subsys)
 	if (ret) {
 		dev_err(bg_data->desc.dev,
 			"%s: BG PIL Boot failed\n", __func__);
+		dev_err(bg_data->desc.dev,
+                        "%s: Fossil: workaround for Dim screen\n", __func__);
+		sys_sync();
+                kernel_restart(NULL);
 		return ret;
 	}
 	ret = wait_for_err_ready(bg_data);
