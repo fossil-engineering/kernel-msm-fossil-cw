@@ -190,6 +190,8 @@ void setup_swap_ratio(struct swap_info_struct *p, int prio)
 
 int swap_ratio(struct swap_info_struct **si, int node)
 {
+
+	return -ENODEV;
 	if (!sysctl_swap_ratio_enable)
 		return -ENODEV;
 
