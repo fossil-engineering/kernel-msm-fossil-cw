@@ -163,4 +163,10 @@ config FB_MSM_MDSS_FRC_DEBUG
 	statistics and check whether its output pattern matches expected
 	cadence.
 
+config FB_MSM_AUO_HBM
+	bool "AUO HBM Mode"
+	default n
+	---help---
+	  Some of AUO panels support HBM mode. This config suports enable HBM mode for these AUO panels.
+	  The HBM commands will be defined in DTB following target's panel.
 endif

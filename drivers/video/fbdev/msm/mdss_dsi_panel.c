@@ -29,6 +29,9 @@
 #include "mdss_dsi.h"
 #include "mdss_dba_utils.h"
 #include "mdss_debug.h"
+#if defined (CONFIG_FB_MSM_AUO_HBM)
+#include "auo/auo_hbm.h"
+#endif /* CONFIG_FB_MSM_AUO_HBM */
 
 #define DT_CMD_HDR 6
 #define DEFAULT_MDP_TRANSFER_TIME 14000
@@ -186,7 +189,7 @@ static void mdss_dsi_panel_apply_settings(struct mdss_dsi_ctrl_pdata *ctrl,
 }
 
 
-static void mdss_dsi_panel_cmds_send(struct mdss_dsi_ctrl_pdata *ctrl,
+void mdss_dsi_panel_cmds_send(struct mdss_dsi_ctrl_pdata *ctrl,
 			struct dsi_panel_cmds *pcmds, u32 flags)
 {
 	struct dcs_cmd_req cmdreq;
@@ -214,6 +217,7 @@ static void mdss_dsi_panel_cmds_send(struct mdss_dsi_ctrl_pdata *ctrl,
 
 	mdss_dsi_cmdlist_put(ctrl, &cmdreq);
 }
+EXPORT_SYMBOL(mdss_dsi_panel_cmds_send);
 
 static char led_pwm1[2] = {0x51, 0x0};	/* DTYPE_DCS_WRITE1 */
 static struct dsi_cmd_desc backlight_cmd = {
@@ -1076,6 +1080,9 @@ static int mdss_dsi_post_panel_on(struct mdss_panel_data *pdata)
 		mdss_dba_utils_hdcp_enable(pinfo->dba_data, true);
 	}
 
+#if defined (CONFIG_FB_MSM_AUO_HBM)
+	mdss_auo_dsi_read_id_code(ctrl);
+#endif /* CONFIG_FB_MSM_AUO_HBM */
 end:
 	/* clear idle state */
 	ctrl->idle = false;
@@ -1098,7 +1105,10 @@ static int mdss_dsi_panel_off(struct mdss_panel_data *pdata)
 				panel_data);
 
 	pr_debug("%s: ctrl=%pK ndx=%d\n", __func__, ctrl, ctrl->ndx);
-
+#if defined (CONFIG_FB_MSM_AUO_HBM)
+	/* Call HBM off before panel is off */
+	mdss_auo_dsi_set_boost_mode(ctrl, false);
+#endif /* CONFIG_FB_MSM_AUO_HBM */
 	if (pinfo->dcs_cmd_by_left) {
 		if (ctrl->ndx != DSI_CTRL_LEFT)
 			goto end;
@@ -1209,7 +1219,7 @@ static void mdss_dsi_parse_trigger(struct device_node *np, char *trigger,
 }
 
 
-static int mdss_dsi_parse_dcs_cmds(struct device_node *np,
+int mdss_dsi_parse_dcs_cmds(struct device_node *np,
 		struct dsi_panel_cmds *pcmds, char *cmd_key, char *link_key)
 {
 	const char *data;
@@ -1296,7 +1306,7 @@ exit_free:
 	kfree(buf);
 	return -ENOMEM;
 }
-
+EXPORT_SYMBOL(mdss_dsi_parse_dcs_cmds);
 
 int mdss_panel_get_dst_fmt(u32 bpp, char mipi_mode, u32 pixel_packing,
 				char *dst_format)
@@ -3160,7 +3170,10 @@ int mdss_dsi_panel_init(struct device_node *node,
 		pr_err("%s:%d panel dt parse failed\n", __func__, __LINE__);
 		return rc;
 	}
-
+#if defined (CONFIG_FB_MSM_AUO_HBM)
+	/* Parse auo hbm cmds */
+	mdss_auo_dsi_parse_hbm_dt(node, ctrl_pdata);
+#endif /* CONFIG_FB_MSM_AUO_HBM */
 	pinfo->dynamic_switch_pending = false;
 	pinfo->is_lpm_mode = false;
 	pinfo->esd_rdy = false;

@@ -1,4 +1,4 @@
 #
 # Makefile for the touchscreen raydium drivers.
 #
-obj-$(CONFIG_TOUCHSCREEN_RAYDIUM_CHIPSET) += raydium_driver.o raydium_sysfs.o raydium_fw_update.o
+obj-$(CONFIG_TOUCHSCREEN_RAYDIUM_CHIPSET) += raydium_i2c_ts.o

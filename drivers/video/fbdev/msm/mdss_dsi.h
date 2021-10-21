@@ -512,6 +512,16 @@ struct mdss_dsi_ctrl_pdata {
 	struct dsi_panel_cmds status_cmds;
 	struct dsi_panel_cmds idle_on_cmds; /* for lp mode */
 	struct dsi_panel_cmds idle_off_cmds;
+#ifdef CONFIG_FB_MSM_AUO_HBM
+	/* Support hbm mode */
+	struct dsi_panel_cmds hbm0_on_cmds;
+	struct dsi_panel_cmds hbm1_on_cmds;
+	struct dsi_panel_cmds hbm_off_cmds;
+	/* boost mode */
+	char read_back_param[1];
+	/* For Module/Driver ID*/
+	char id3_code[1];
+#endif /* CONFIG_FB_MSM_AUO_HBM */
 	u32 *status_valid_params;
 	u32 *status_cmds_rlen;
 	u32 *status_value;
@@ -702,12 +712,15 @@ void mdss_dsi_lp_cd_rx(struct mdss_dsi_ctrl_pdata *ctrl);
 void mdss_dsi_read_phy_revision(struct mdss_dsi_ctrl_pdata *ctrl);
 int mdss_dsi_panel_cmd_read(struct mdss_dsi_ctrl_pdata *ctrl, char cmd0,
 		char cmd1, void (*fxn)(int), char *rbuf, int len);
+void mdss_dsi_panel_cmds_send(struct mdss_dsi_ctrl_pdata *ctrl,
+                        struct dsi_panel_cmds *pcmds, u32 flags);
 int mdss_dsi_panel_init(struct device_node *node,
 		struct mdss_dsi_ctrl_pdata *ctrl_pdata,
 		int ndx);
 int mdss_dsi_panel_timing_switch(struct mdss_dsi_ctrl_pdata *ctrl_pdata,
 			struct mdss_panel_timing *timing);
-
+int mdss_dsi_parse_dcs_cmds(struct device_node *np,
+                struct dsi_panel_cmds *pcmds, char *cmd_key, char *link_key);
 int mdss_panel_parse_bl_settings(struct device_node *np,
 			struct mdss_dsi_ctrl_pdata *ctrl_pdata);
 int mdss_panel_get_dst_fmt(u32 bpp, char mipi_mode, u32 pixel_packing,

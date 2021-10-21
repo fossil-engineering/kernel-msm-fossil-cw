@@ -55,6 +55,10 @@
 #include "mdss_mdp.h"
 #include "mdss_sync.h"
 
+#if defined (CONFIG_FB_MSM_AUO_HBM)
+#include "auo/auo_hbm.h"
+#endif /* CONFIG_FB_MSM_AUO_HBM */
+
 #ifdef CONFIG_FB_MSM_TRIPLE_BUFFER
 #define MDSS_FB_NUM 3
 #else
@@ -944,6 +948,11 @@ static DEVICE_ATTR(msm_fb_persist_mode, 0644,
 	mdss_fb_get_persist_mode, mdss_fb_change_persist_mode);
 static DEVICE_ATTR(idle_power_collapse, 0444, mdss_fb_idle_pc_notify, NULL);
 
+#if defined (CONFIG_FB_MSM_AUO_HBM)
+static DEVICE_ATTR(msm_fb_boost_mode, 0644,
+		mdss_fb_get_boost_mode, mdss_fb_set_boost_mode);
+#endif /* CONFIG_FB_MSM_AUO_HBM */
+
 static struct attribute *mdss_fb_attrs[] = {
 	&dev_attr_msm_fb_type.attr,
 	&dev_attr_msm_fb_split.attr,
@@ -958,6 +967,9 @@ static struct attribute *mdss_fb_attrs[] = {
 	&dev_attr_measured_fps.attr,
 	&dev_attr_msm_fb_persist_mode.attr,
 	&dev_attr_idle_power_collapse.attr,
+#if defined (CONFIG_FB_MSM_AUO_HBM)
+	&dev_attr_msm_fb_boost_mode.attr,
+#endif /* CONFIG_FB_MSM_AUO_HBM */
 	NULL,
 };
 

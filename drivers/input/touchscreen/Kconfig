@@ -1417,12 +1417,56 @@ config TOUCHSCREEN_SYNAPTICS_TCM
 
 source "drivers/input/touchscreen/synaptics_tcm/Kconfig"
 
-config TOUCHSCREEN_RAYDIUM_CHIPSET
-	bool "Raydium WT030 touchpanel CHIPSET"
-	depends on I2C
+choice
+	prompt "Raydium WT030 Touchscreen driver series"
+	optional
 	help
-	  Say Y here if you have a Raydium WT030 CHIPSET touchscreen.
+	  Specify the chiptype for building touch driver. Currently, following controllers are supported:
+	  U128BLX01, U128BLX02, H120BLX01 and U128BLA03.
 
-	  If unsure, say N.
+config TOUCHSCREEN_RAYDIUM_U128BLX01_CHIPSET
+	select TOUCHSCREEN_RAYDIUM_CHIPSET
+	tristate "Raydium WT030 touchpanel CHIPSET U128BLX01"
+	help
+	  Say Y here if you have Raydium series I2C touchscreen,
+	  such as U128BLX01, connected to your system.
+	    If unsure, say N.
+	  To compile this driver as a module, choose M here: the
+	  module will be called raydium_i2c_ts.
+
+config TOUCHSCREEN_RAYDIUM_U128BLX02_CHIPSET
+	select TOUCHSCREEN_RAYDIUM_CHIPSET
+	tristate "Raydium WT030 touchpanel CHIPSET U128BLX02"
+	help
+	  Say Y here if you have Raydium series I2C touchscreen,
+	  such as U128BLX02, connected to your system.
+	    If unsure, say N.
+	  To compile this driver as a module, choose M here: the
+	  module will be called raydium_i2c_ts.
+
+config TOUCHSCREEN_RAYDIUM_H120BLX01_CHIPSET
+	select TOUCHSCREEN_RAYDIUM_CHIPSET
+	tristate "Raydium WT030 touchpanel CHIPSET H120BLX01"
+	help
+	  Say Y here if you have Raydium series I2C touchscreen,
+	  such as H120BLX01, connected to your system.
+	    If unsure, say N.
+	  To compile this driver as a module, choose M here: the
+	  module will be called raydium_i2c_ts.
+
+config TOUCHSCREEN_RAYDIUM_U128BLA03_CHIPSET
+	select TOUCHSCREEN_RAYDIUM_CHIPSET
+	tristate "Raydium WT030 touchpanel CHIPSET H120BLA03"
+	help
+	  Say Y here if you have Raydium series I2C touchscreen,
+	  such as H120BLA03, connected to your system.
+	    If unsure, say N.
+	  To compile this driver as a module, choose M here: the
+	  module will be called raydium_i2c_ts.
+endchoice
+
+config TOUCHSCREEN_RAYDIUM_CHIPSET
+	bool
+	depends on I2C
 
 endif
