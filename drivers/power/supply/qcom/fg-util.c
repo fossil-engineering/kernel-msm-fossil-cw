@@ -923,6 +923,16 @@ int fg_get_msoc(struct fg_dev *fg, int *msoc)
 	else
 		*msoc = DIV_ROUND_CLOSEST((*msoc - 1) * (FULL_CAPACITY - 2),
 				FULL_SOC_RAW - 2) + 1;
+	/* Correct the msoc value based on TWM threshold value */
+	if (*msoc <= fg->twm_soc_value) {
+		if (fg->online_status)
+			*msoc = 1;
+		else
+			*msoc = 0;
+	} else
+		 *msoc = DIV_ROUND_CLOSEST((*msoc - fg->twm_soc_value) *
+			FULL_CAPACITY,
+			FULL_CAPACITY - fg->twm_soc_value);
 	return 0;
 }
 
