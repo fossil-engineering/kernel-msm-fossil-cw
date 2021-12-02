@@ -385,6 +385,9 @@ struct smb_charger {
 	bool			battery_hot_limit_bat_flag;
 	int				battery_hot_limit_ibat;
 	bool			battery_hot_limit_usb_flag;
+	bool			temp_vs_current_ibat_flag;
+	int			temp_vs_current_ibat;
+	int			temp_vs_current_state;
 	int				chg_status;
 	int				batt_capacity;
 	int				saved_iusb;

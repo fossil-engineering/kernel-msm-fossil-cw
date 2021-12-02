@@ -33,6 +33,11 @@
 #define USBIN_SDP    350000
 #define USBIN_FLOAT  500000
 #define SMBLIB_DEBUG_INFO   0
+
+struct temp_vs_current {
+	int temperature;
+	int ibat;
+};
 /* USB charge state*/
 enum {
 	NO_CHARGE_MODE,
@@ -2204,6 +2209,35 @@ int smblib_get_jeita_status(struct smb_charger *chg)
 #define CHG_STEP_CURRENT 25000
 #define BATTERY_LIMIT_DISABLE_TEMP 38
 #define BATTERY_HOT_LIMIT_IBAT 125000
+static const struct temp_vs_current temp_vs_current_table[] = {
+	{ 18, 600000 },
+	{ 30, 550000 },  //25 environment temp
+	{ 35, 450000 },
+	{ 40, 350000 },
+	{ 45, 300000 },
+};
+
+void smblib_temp_vs_current_one_time(struct smb_charger *chg,
+				int batt_temp)
+{
+	if (batt_temp < temp_vs_current_table[1].temperature)
+		chg->temp_vs_current_state = 0;
+	else if (batt_temp < temp_vs_current_table[2].temperature)
+		chg->temp_vs_current_state = 1;
+	else if (batt_temp < temp_vs_current_table[3].temperature)
+		chg->temp_vs_current_state = 2;
+	else if (batt_temp < temp_vs_current_table[4].temperature)
+		chg->temp_vs_current_state = 3;
+	else
+		chg->temp_vs_current_state = 4;
+
+	pr_info("one time chg->temp_vs_current_state %d\n",chg->temp_vs_current_state);
+
+	chg->temp_vs_current_ibat = temp_vs_current_table[chg->temp_vs_current_state].ibat;
+	pr_info("one time battery temp: %d, limit battery current %dmA\n",
+		batt_temp, chg->temp_vs_current_ibat/1000);
+	smblib_update_charge_current(chg);
+}
 void smblib_battery_hot_limit_current(struct smb_charger *chg,
 				int batt_temp)
 {
@@ -2219,11 +2253,21 @@ void smblib_battery_hot_limit_current(struct smb_charger *chg,
 		chg->chg_status == POWER_SUPPLY_STATUS_FULL) ||
 		batt_temp <= BATTERY_LIMIT_DISABLE_TEMP)) {
 		chg->battery_hot_limit_bat_flag = 0;
+		chg->temp_vs_current_ibat_flag= 0;
 		smblib_update_charge_current(chg);
+		pr_info("Battery temperature under 38 degC, disable battery hot limit");
 	}
 
 	if (chg->vbus_state) {
 		jeita_state = smblib_get_jeita_status(chg);
+		if (!chg->battery_hot_limit_usb_flag &&
+			 !chg->battery_hot_limit_bat_flag &&
+			chg->charge_state == CHARGE_2C_MODE ) {
+			if (!chg->temp_vs_current_ibat_flag) {
+				chg->temp_vs_current_ibat_flag = 1;
+				smblib_temp_vs_current_one_time(chg, batt_temp);
+			}
+		}
 		//limit usb current
 		if (!chg->battery_hot_limit_usb_flag &&
 			chg->chg_status == POWER_SUPPLY_STATUS_FULL &&
@@ -2239,7 +2283,7 @@ void smblib_battery_hot_limit_current(struct smb_charger *chg,
 			} else
 				chg->saved_iusb = data * 25 * 1000;
 			usb_current = BATTERY_HOT_LIMIT_USB_CURRENT;
-			pr_info("battery temp: %d, limit usb current %dmA\n",
+			pr_info("Battery HOT: battery temp: %d, limit usb current %dmA\n",
 				batt_temp, usb_current/1000);
 			//limit usb input current
 			smblib_set_icl_current(chg, usb_current);
@@ -3955,9 +3999,12 @@ static void smblib_update_charge_current(struct smb_charger *chg)
 	if (chg->battery_hot_limit_bat_flag) {
 		prop.intval = chg->battery_hot_limit_ibat;
 	} else {
-		if (chg->charge_state == CHARGE_2C_MODE)
-			prop.intval = chg->charge_1c_ma * 2;
-		else
+		if (chg->charge_state == CHARGE_2C_MODE) {
+			if (chg->temp_vs_current_ibat_flag)
+				prop.intval = chg->temp_vs_current_ibat;
+			else
+				prop.intval = chg->charge_1c_ma * 2;
+		} else
 			prop.intval = chg->charge_1c_ma;
 	}
 
@@ -4022,6 +4069,7 @@ void smblib_usb_plugin_locked(struct smb_charger *chg)
 		chg->vbus_state = 0;
 		chg->battery_hot_limit_usb_flag = 0;
 		chg->battery_hot_limit_bat_flag = 0;
+		chg->temp_vs_current_ibat_flag = 0;
 		smblib_dbg(chg, PR_INTERRUPT, "usbin-plugout: state=%d, vbus_debounce_count = %d\n",
 			chg->charge_state, chg->vbus_debounce_count);
 		usleep_range(1000,2000);
@@ -6089,12 +6137,15 @@ int smblib_init(struct smb_charger *chg)
 	chg->vbus_state = 0;
 	chg->bootup_phase = BOOT_UP;
 	chg->battery_hot_limit_bat_flag = 0;
+	chg->temp_vs_current_ibat_flag = 0;
 	chg->battery_hot_limit_ibat = 0;
+	chg->temp_vs_current_ibat = 0;
 	chg->battery_hot_limit_usb_flag = 0;
 	chg->chg_status = 0;
 	chg->batt_capacity  = 0;
 	chg->saved_iusb = 0;
 	chg->saved_temp = 0;
+	chg->temp_vs_current_state =0;
 	/* Wait boot-up for 90 seconds */
 	schedule_delayed_work(&chg->bootup_2c_work,
 		msecs_to_jiffies(90000));
