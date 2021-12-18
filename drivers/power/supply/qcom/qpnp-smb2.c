@@ -227,6 +227,9 @@ static int smb2_parse_dt(struct smb2 *chip)
 	chg->sw_jeita_enabled = of_property_read_bool(node,
 				"qcom,sw-jeita-enable");
 
+	chg->aicl_rerun_enable = of_property_read_bool(node,
+				"qcom,aicl_rerun_enable");
+
 	rc = of_property_read_u32(node, "qcom,wd-bark-time-secs",
 					&chip->dt.wd_bark_time);
 	if (rc < 0 || chip->dt.wd_bark_time < MIN_WD_BARK_TIME)
@@ -242,6 +245,8 @@ static int smb2_parse_dt(struct smb2 *chip)
 				"qcom,fcc-max-ua", &chg->batt_profile_fcc_ua);
 	if (rc < 0)
 		chg->batt_profile_fcc_ua = -EINVAL;
+	else
+		chg->charge_1c_ma = chg->batt_profile_fcc_ua * 1000;
 
 	rc = of_property_read_u32(node,
 				"qcom,fv-max-uv", &chg->batt_profile_fv_uv);
@@ -1668,12 +1673,39 @@ static int smb2_init_hw(struct smb2 *chip)
 	 * AICL configuration:
 	 * start from min and AICL ADC disable
 	 */
-	rc = smblib_masked_write(chg, USBIN_AICL_OPTIONS_CFG_REG,
-			USBIN_AICL_START_AT_MAX_BIT
-				| USBIN_AICL_ADC_EN_BIT, 0);
-	if (rc < 0) {
-		dev_err(chg->dev, "Couldn't configure AICL rc=%d\n", rc);
-		return rc;
+	if (chg->aicl_rerun_enable) {
+		rc = smblib_masked_write(chg, USBIN_AICL_OPTIONS_CFG_REG,
+				SUSPEND_ON_COLLAPSE_USBIN_BIT
+					| USBIN_AICL_HDC_EN_BIT
+					| USBIN_AICL_RERUN_EN_BIT
+					| USBIN_AICL_EN_BIT,
+				SUSPEND_ON_COLLAPSE_USBIN_BIT
+					| USBIN_AICL_HDC_EN_BIT
+					| USBIN_AICL_RERUN_EN_BIT
+					| USBIN_AICL_EN_BIT);
+		if (rc < 0) {
+			dev_err(chg->dev, "Couldn't configure AICL rc=%d\n",
+									rc);
+			return rc;
+		}
+		/*5v_aicl_threshold - 4.0v*/
+		rc = smblib_masked_write(chg, USBIN_5V_AICL_THRESHOLD_CFG_REG,
+				USBIN_5V_AICL_THRESHOLD_CFG_MASK, 0);
+		if (rc < 0) {
+			dev_err(chg->dev, "Couldn't configure AICL THRESHOLD rc=%d\n",
+				rc);
+			return rc;
+		}
+	} else {
+		rc = smblib_masked_write(chg, USBIN_AICL_OPTIONS_CFG_REG,
+				USBIN_AICL_START_AT_MAX_BIT
+					| USBIN_AICL_ADC_EN_BIT
+					| USBIN_AICL_EN_BIT, 0);
+		if (rc < 0) {
+			dev_err(chg->dev, "Couldn't configure AICL rc=%d\n",
+									rc);
+			return rc;
+		}
 	}
 
 	/* Configure charge enable for software control; active high */
@@ -2415,7 +2447,7 @@ static int smb2_probe(struct platform_device *pdev)
 	chg->die_health = -EINVAL;
 	chg->name = "PMI";
 	chg->audio_headset_drp_wait_ms = &__audio_headset_drp_wait_ms;
-
+	chg->aicl_rerun_enable = 0;
 	chg->regmap = dev_get_regmap(chg->dev->parent, NULL);
 	if (!chg->regmap) {
 		pr_err("parent regmap is missing\n");

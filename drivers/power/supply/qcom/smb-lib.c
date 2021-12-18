@@ -25,6 +25,28 @@
 #include "step-chg-jeita.h"
 #include "storm-watch.h"
 
+/* For CDP/DCP delay work in 5 seconds */
+#define CDP_DCP_DET_MS	(5 * 1000)
+/* USBIN current limit */
+#define USBIN_CDP_DCP_1C	350000
+#define USBIN_CDP_DCP_2C	800000
+#define USBIN_SDP    350000
+#define USBIN_FLOAT  500000
+#define SMBLIB_DEBUG_INFO   0
+/* USB charge state*/
+enum {
+	NO_CHARGE_MODE,
+	CHARGE_1C_MODE,
+	CHARGE_2C_MODE,
+	CHARGE_PLUG_OUT_DEBOUNCE,
+	CHARGE_CDP_SDP,
+};
+
+enum {
+	BOOT_UP,
+	BOOT_UP_DONE,
+};
+
 #define smblib_err(chg, fmt, ...)		\
 	pr_err("%s: %s: " fmt, chg->name,	\
 		__func__, ##__VA_ARGS__)	\
@@ -47,6 +69,10 @@ static bool is_secure(struct smb_charger *chg, int addr)
 	return (bool)((addr & 0xFF) >= 0xA0);
 }
 
+static void smblib_update_charge_current(struct smb_charger *chg);
+#if SMBLIB_DEBUG_INFO
+static int smblib_debug_info(struct smb_charger *chg);
+#endif
 int smblib_read(struct smb_charger *chg, u16 addr, u8 *val)
 {
 	unsigned int temp;
@@ -170,6 +196,9 @@ int smblib_get_charge_param(struct smb_charger *chg,
 	int rc = 0;
 	u8 val_raw;
 
+#if SMBLIB_DEBUG_INFO
+	smblib_debug_info(chg);
+#endif
 	rc = smblib_read(chg, param->reg, &val_raw);
 	if (rc < 0) {
 		smblib_err(chg, "%s: Couldn't read from 0x%04x rc=%d\n",
@@ -201,6 +230,15 @@ int smblib_get_usb_suspend(struct smb_charger *chg, int *suspend)
 
 	return rc;
 }
+
+static u8 usbicl_rerun_time;
+#define AICL_RERUN_TIME_3S 0
+#define AICL_RERUN_TIME_12S 1
+#define AICL_RERUN_TIME_45S 2
+#define AICL_RERUN_TIME_3min 3
+static char *usbicl_rerun_time_text[] = {
+		"3s", "12s", "45s", "3min"
+};
 
 struct apsd_result {
 	const char * const name;
@@ -357,11 +395,21 @@ static int smblib_set_opt_freq_buck(struct smb_charger *chg, int fsw_khz)
 	return rc;
 }
 
+#define BATTERY_HOT_LIMIT_USB_CURRENT 50000
 int smblib_set_charge_param(struct smb_charger *chg,
 			    struct smb_chg_param *param, int val_u)
 {
 	int rc = 0;
 	u8 val_raw;
+
+	if (!strcmp(param->name, "usb input current limit")) {
+		if (chg->battery_hot_limit_usb_flag) {
+			if (val_u >= BATTERY_HOT_LIMIT_USB_CURRENT)
+				val_u = BATTERY_HOT_LIMIT_USB_CURRENT;
+			pr_info("battery hot, limit usbin to %dmA\n",
+						val_u/1000);
+		}
+	}
 
 	if (param->set_proc) {
 		rc = param->set_proc(param, val_u, &val_raw);
@@ -728,6 +776,7 @@ static void smblib_uusb_removal(struct smb_charger *chg)
 	vote(chg->usb_icl_votable, USBIN_USBIN_BOOST_VOTER, false, 0);
 
 	cancel_delayed_work_sync(&chg->hvdcp_detect_work);
+	cancel_delayed_work_sync(&chg->cdp_dcp_detect_work);
 
 	if (chg->wa_flags & QC_AUTH_INTERRUPT_WA_BIT) {
 		/* re-enable AUTH_IRQ_EN_CFG_BIT */
@@ -960,18 +1009,40 @@ int smblib_set_icl_current(struct smb_charger *chg, int icl_ua)
 		&& (chg->real_charger_type == POWER_SUPPLY_TYPE_USB)) {
 		rc = set_sdp_current(chg, icl_ua);
 		if (rc < 0) {
-			smblib_err(chg, "Couldn't set SDP ICL rc=%d\n", rc);
+			smblib_err(chg, "Couldn't set SDP ICL rc=%d\n",
+				rc);
 			goto enable_icl_changed_interrupt;
 		}
 	} else {
-		set_sdp_current(chg, 100000);
-		rc = smblib_set_charge_param(chg, &chg->param.usb_icl, icl_ua);
-		if (rc < 0) {
-			smblib_err(chg, "Couldn't set HC ICL rc=%d\n", rc);
-			goto enable_icl_changed_interrupt;
+		/*
+		* If real_charger_type is SDP and
+		* typec_mode is POWER_SUPPLY_TYPEC_NONE
+		* configure current = 350mA
+		*/
+		if(chg->real_charger_type == POWER_SUPPLY_TYPE_USB) {
+			rc = smblib_set_charge_param(chg,
+				&chg->param.usb_icl, 350000);
+			if (rc < 0) {
+				smblib_err(chg, "Couldn't set HC ICL rc=%d\n",
+						rc);
+				goto enable_icl_changed_interrupt;
+			}
+		} else {
+			set_sdp_current(chg, 100000);
+			rc = smblib_set_charge_param(chg,
+				&chg->param.usb_icl, icl_ua);
+			if (rc < 0) {
+				smblib_err(chg, "Couldn't set HC ICL rc=%d\n",
+						rc);
+				goto enable_icl_changed_interrupt;
+			}
 		}
 	}
-
+	/* Update battery charge current */
+	smblib_update_charge_current(chg);
+#if SMBLIB_DEBUG_INFO
+	smblib_debug_info(chg);
+#endif
 override_suspend_config:
 	/* determine if override needs to be enforced */
 	override = true;
@@ -1340,6 +1411,9 @@ static int smblib_hvdcp_enable_vote_callback(struct votable *votable,
 	 */
 	if (!hvdcp_enable)
 		val = HVDCP_EN_BIT;
+
+	/* Force disable HVDCP */
+	val = 0;
 
 	rc = smblib_masked_write(chg, USBIN_OPTIONS_1_CFG_REG,
 				 HVDCP_EN_BIT | HVDCP_AUTH_ALG_EN_CFG_BIT,
@@ -1828,12 +1902,15 @@ int smblib_get_prop_batt_capacity(struct smb_charger *chg,
 
 	if (chg->fake_capacity >= 0) {
 		val->intval = chg->fake_capacity;
+		chg->batt_capacity = val->intval;
 		return 0;
 	}
 
-	if (chg->bms_psy)
+	if (chg->bms_psy) {
 		rc = power_supply_get_property(chg->bms_psy,
 				POWER_SUPPLY_PROP_CAPACITY, val);
+		chg->batt_capacity = val->intval;
+	}
 	return rc;
 }
 
@@ -1879,6 +1956,7 @@ int smblib_get_prop_batt_status(struct smb_charger *chg,
 			val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
 			break;
 		}
+		chg->chg_status = val->intval;
 		return rc;
 	}
 
@@ -1902,12 +1980,14 @@ int smblib_get_prop_batt_status(struct smb_charger *chg,
 		break;
 	}
 
+	chg->chg_status = val->intval;
 	if (val->intval != POWER_SUPPLY_STATUS_CHARGING)
 		return 0;
 
 	if (!usb_online && dc_online
 		&& chg->fake_batt_status == POWER_SUPPLY_STATUS_FULL) {
 		val->intval = POWER_SUPPLY_STATUS_FULL;
+		chg->chg_status = val->intval;
 		return 0;
 	}
 
@@ -1934,6 +2014,7 @@ int smblib_get_prop_batt_status(struct smb_charger *chg,
 	if (!qnovo_en && !stat)
 		val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
 
+	chg->chg_status = val->intval;
 	return 0;
 }
 
@@ -2088,17 +2169,131 @@ int smblib_get_prop_charge_qnovo_enable(struct smb_charger *chg,
 	return 0;
 }
 
+#define JEITA_NORMAL 0
+#define JEITA_HOT 1
+#define JEITA_COLD 2
+int smblib_get_jeita_status(struct smb_charger *chg)
+{
+	int rc;
+	u8 data;
+
+	data = 0;
+	rc = smblib_read(chg, 0x00001007, &data);
+	if (rc < 0) {
+		smblib_err(chg, "Couldn't read jeita status\n");
+		return 0;
+	}
+	switch (data & 0xf) {
+	case 0:
+		return JEITA_NORMAL;
+	case 1:
+	case 4:
+	case 5:
+		return JEITA_COLD;
+	case 2:
+	case 8:
+	case 10:
+		return JEITA_HOT;
+	default:
+		return JEITA_NORMAL;
+	}
+	return 0;
+}
+
+#define CHG_STEP_TEMP 2
+#define CHG_STEP_CURRENT 25000
+#define BATTERY_LIMIT_DISABLE_TEMP 38
+#define BATTERY_HOT_LIMIT_IBAT 125000
+void smblib_battery_hot_limit_current(struct smb_charger *chg,
+				int batt_temp)
+{
+	int rc;
+	int jeita_state, usb_current;
+	u8 data;
+
+	//Reset ibat to original value:
+	//(1) battery is 100% and full
+	//(2) temp <= 38 degC
+	if (chg->battery_hot_limit_bat_flag &&
+		((chg->batt_capacity == 100 &&
+		chg->chg_status == POWER_SUPPLY_STATUS_FULL) ||
+		batt_temp <= BATTERY_LIMIT_DISABLE_TEMP)) {
+		chg->battery_hot_limit_bat_flag = 0;
+		smblib_update_charge_current(chg);
+	}
+
+	if (chg->vbus_state) {
+		jeita_state = smblib_get_jeita_status(chg);
+		//limit usb current
+		if (!chg->battery_hot_limit_usb_flag &&
+			chg->chg_status == POWER_SUPPLY_STATUS_FULL &&
+			chg->batt_capacity != 100 &&
+			jeita_state == JEITA_HOT) {
+			chg->battery_hot_limit_usb_flag = 1;
+			//save original usb current
+			data = 0;
+			rc = smblib_read(chg, 0x1370, &data);
+			if (rc < 0) {
+				smblib_err(chg, "Couldn't read usb current\n");
+				chg->saved_iusb = 500000;
+			} else
+				chg->saved_iusb = data * 25 * 1000;
+			usb_current = BATTERY_HOT_LIMIT_USB_CURRENT;
+			pr_info("battery temp: %d, limit usb current %dmA\n",
+				batt_temp, usb_current/1000);
+			//limit usb input current
+			smblib_set_icl_current(chg, usb_current);
+		} else if (chg->battery_hot_limit_usb_flag &&
+			jeita_state == JEITA_NORMAL) {
+			pr_info("battery temp: %d, resume usb current: %dmA\n",
+				batt_temp, chg->saved_iusb/1000);
+			chg->battery_hot_limit_usb_flag = 0;
+			//resume usb current
+			smblib_set_icl_current(chg, chg->saved_iusb);
+			//limit battery currernt
+			chg->saved_temp = batt_temp;
+			chg->battery_hot_limit_bat_flag = 1;
+			chg->battery_hot_limit_ibat = BATTERY_HOT_LIMIT_IBAT;
+			smblib_update_charge_current(chg);
+		}
+
+		//dynamically change battery current
+		if (chg->battery_hot_limit_bat_flag && batt_temp <= 44) {
+			if (chg->saved_temp > batt_temp &&
+				chg->saved_temp - batt_temp >= CHG_STEP_TEMP) {
+				//temperature cool-down, increase ibat
+				//44 -> 42 -> 40
+				chg->battery_hot_limit_ibat += CHG_STEP_CURRENT;
+				smblib_update_charge_current(chg);
+				chg->saved_temp = batt_temp;
+			} else if (batt_temp > chg->saved_temp &&
+				batt_temp - chg->saved_temp >= CHG_STEP_TEMP) {
+				//temperature warm-up, decrease ibat
+				//40 -> 42 -> 44
+				chg->battery_hot_limit_ibat -= CHG_STEP_CURRENT;
+				smblib_update_charge_current(chg);
+				chg->saved_temp = batt_temp;
+			}
+		}
+	}
+}
+
 int smblib_get_prop_from_bms(struct smb_charger *chg,
 				enum power_supply_property psp,
 				union power_supply_propval *val)
 {
 	int rc;
+	int batt_temp;
 
 	if (!chg->bms_psy)
 		return -EINVAL;
 
 	rc = power_supply_get_property(chg->bms_psy, psp, val);
 
+	if (psp == POWER_SUPPLY_PROP_TEMP) {
+		batt_temp = val->intval/10;
+		smblib_battery_hot_limit_current(chg, batt_temp);
+	}
 	return rc;
 }
 
@@ -2457,6 +2652,35 @@ int smblib_get_prop_usb_online(struct smb_charger *chg,
 
 	val->intval = (stat & USE_USBIN_BIT) &&
 		      (stat & VALID_INPUT_POWER_SOURCE_STS_BIT);
+
+	/*
+	 * weak charge status detection
+	 * This method is used in charge 2C mode
+	 * and when valid_input_power is 1 but use_usb_bit jumps 0 or 1.
+	 */
+	if (chg->charge_state == CHARGE_2C_MODE) {
+		smblib_dbg(chg, PR_MISC, "smblib_get_prop_usb_online: %d,"
+			"use_usbin: %u, valid_input_source: %u,"
+			"last_use_usbin:%u\n",val->intval, (stat & USE_USBIN_BIT),
+			(stat & VALID_INPUT_POWER_SOURCE_STS_BIT),
+			chg->last_use_usbin);
+
+		if ((stat & VALID_INPUT_POWER_SOURCE_STS_BIT) == 0) {
+			/* usb remove */
+			chg->weak_chg_state_count = 0;
+		} else if (chg->last_use_usbin &&
+			((stat & USE_USBIN_BIT) == 0)) {
+			/* update immediately */
+			chg->last_use_usbin = (stat & USE_USBIN_BIT);
+
+			/* counter is added when use_usbin changes from 1 to 0 */
+			chg->weak_chg_state_count += 1;
+			smblib_dbg(chg, PR_MISC, "use_usbin changes from 1 to 0,"
+				"weak_chg_state_count=%d\n", chg->weak_chg_state_count);
+		}
+	}
+	chg->last_use_usbin = (stat & USE_USBIN_BIT);
+
 	return rc;
 }
 
@@ -2769,11 +2993,11 @@ int smblib_get_prop_die_health(struct smb_charger *chg,
 	return 0;
 }
 
-#define SDP_CURRENT_UA			500000
-#define CDP_CURRENT_UA			1500000
-#define DCP_CURRENT_UA			1500000
+#define SDP_CURRENT_UA			350000
+#define CDP_CURRENT_UA			800000
+#define DCP_CURRENT_UA			800000
 #define HVDCP_CURRENT_UA		3000000
-#define TYPEC_DEFAULT_CURRENT_UA	900000
+#define TYPEC_DEFAULT_CURRENT_UA	5000000
 #define TYPEC_MEDIUM_CURRENT_UA		1500000
 #define TYPEC_HIGH_CURRENT_UA		3000000
 static int get_rp_based_dcp_current(struct smb_charger *chg, int typec_mode)
@@ -3530,6 +3754,16 @@ irqreturn_t smblib_handle_usbin_uv(int irq, void *data)
 	int rc;
 	u8 stat = 0, max_pulses = 0;
 
+	if ((chg->vbus_state == 1) &&
+		(chg->charge_state == CHARGE_2C_MODE)) {
+			if (chg->vbus_debounce_count == 0) {
+				schedule_delayed_work(
+					&chg->charge_2c_status_work,
+					msecs_to_jiffies(500));
+			}
+			chg->vbus_debounce_count += 1;
+	}
+
 	smblib_dbg(chg, PR_INTERRUPT, "IRQ: %s\n", irq_data->name);
 	if (!chg->irq_info[SWITCH_POWER_OK_IRQ].irq_data)
 		return IRQ_HANDLED;
@@ -3647,6 +3881,96 @@ void smblib_usb_plugin_hard_reset_locked(struct smb_charger *chg)
 	smblib_dbg(chg, PR_INTERRUPT, "IRQ: usbin-plugin %s\n",
 					vbus_rising ? "attached" : "detached");
 }
+#if SMBLIB_DEBUG_INFO
+static int smblib_debug_info(struct smb_charger *chg)
+{
+	int rc;
+	u8 data1, data2, data3;
+	union power_supply_propval val;
+
+	rc = smblib_read(chg, 0x00001061, &data1);
+	rc = smblib_read(chg, 0x00001370, &data2);
+	rc = smblib_read(chg, 0x00001607, &data3);
+	smblib_err(chg, "FSC=%d mA, USB_limit=%d mA, MISC_ICL=%d mA\n",
+					data1*25, data2*25, data3*25);
+
+	/* Jeita debug */
+	data1 = 0; data2 = 0; data3 = 0;
+	rc = smblib_read(chg, 0x00001090, &data1);
+	rc = smblib_read(chg, 0x00001091, &data2);
+	rc = smblib_read(chg, 0x00001092, &data3);
+	smblib_err(chg, "JEITA_EN_CFG: 0x%x, JEITA_FV: 0x%x (delta = %d mV),"
+		"JEITA_CC: 0x%x (delta = %d mA)\n",
+		data1, data2, data2*75, data3, data3*25);
+
+	/* read battery temp */
+	if (chg->bms_psy) {
+		rc = power_supply_get_property(chg->bms_psy,
+			POWER_SUPPLY_PROP_TEMP, &val);
+	} else
+		val.intval = 0;
+	/* chg_status_2 */
+	data1 = 0;
+
+	rc = smblib_read(chg, 0x00001007, &data1);
+	switch (data1 & 0xf) {
+	case 0:
+		smblib_err(chg, "battery_temp: %d, Normal\n",
+			val.intval/10);
+		break;
+	case 1:
+		smblib_err(chg, "battery_temp: %d, Hard Cold\n",
+			val.intval/10);
+		break;
+	case 2:
+		smblib_err(chg, "battery_temp: %d, Hard Hot\n",
+			val.intval/10);
+		break;
+	case 4:
+		smblib_err(chg, "battery_temp: %d, Soft Cold\n",
+			val.intval/10);
+		break;
+	case 8:
+		smblib_err(chg, "battery_temp: %d, Soft Hot\n",
+			val.intval/10);
+		break;
+	}
+
+	/* chg_status_3 */
+	data1 = 0;
+	data2 = 0;
+	rc = smblib_read(chg, 0x00001009, &data1);
+	rc = smblib_read(chg, 0x0000100A, &data2);
+	smblib_err(chg, "JEITA compensation: FV = %dmV, CC = %dmA\n",
+				34875+data1*75, data2*25);
+
+	return rc;
+}
+#endif
+static void smblib_update_charge_current(struct smb_charger *chg)
+{
+	int rc = -EINVAL;
+	union power_supply_propval prop = {0, };
+
+	if (chg->battery_hot_limit_bat_flag) {
+		prop.intval = chg->battery_hot_limit_ibat;
+	} else {
+		if (chg->charge_state == CHARGE_2C_MODE)
+			prop.intval = chg->charge_1c_ma * 2;
+		else
+			prop.intval = chg->charge_1c_ma;
+	}
+
+	smblib_err(chg, "FSC = %dmA\n", prop.intval/1000);
+
+	rc = power_supply_set_property(chg->batt_psy,
+		POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX, &prop);
+
+	/* Notify gauge to reset JEITA CC configuration */
+	if(chg->bms_psy)
+		rc = power_supply_set_property(chg->bms_psy,
+			POWER_SUPPLY_PROP_UPDATE_NOW, &prop);
+}
 
 #define PL_DELAY_MS			30000
 void smblib_usb_plugin_locked(struct smb_charger *chg)
@@ -3656,6 +3980,7 @@ void smblib_usb_plugin_locked(struct smb_charger *chg)
 	bool vbus_rising;
 	struct smb_irq_data *data;
 	struct storm_watch *wdata;
+	union power_supply_propval vol_now;
 
 	rc = smblib_read(chg, USBIN_BASE + INT_RT_STS_OFFSET, &stat);
 	if (rc < 0) {
@@ -3664,10 +3989,19 @@ void smblib_usb_plugin_locked(struct smb_charger *chg)
 	}
 
 	vbus_rising = (bool)(stat & USBIN_PLUGIN_RT_STS_BIT);
+	smblib_err(chg, "vbus_rising: %d\n", vbus_rising);
 	smblib_set_opt_freq_buck(chg, vbus_rising ? chg->chg_freq.freq_5V :
 						chg->chg_freq.freq_removal);
 
 	if (vbus_rising) {
+		smblib_dbg(chg, PR_INTERRUPT, "usbin-plugin: state=%d, weak = %d\n",
+			chg->charge_state, chg->vbus_weak);
+		chg->vbus_state = 1;
+		if (chg->charge_state == NO_CHARGE_MODE) {
+			/* set charge state to CHARGE_1C_MODE*/
+			chg->charge_state = CHARGE_1C_MODE;
+		}
+
 		rc = smblib_request_dpdm(chg, true);
 		if (rc < 0)
 			smblib_err(chg, "Couldn't to enable DPDM rc=%d\n", rc);
@@ -3685,6 +4019,58 @@ void smblib_usb_plugin_locked(struct smb_charger *chg)
 				!chg->pd_active)
 			pr_err("APSD disabled on vbus rising without PD\n");
 	} else {
+		chg->vbus_state = 0;
+		chg->battery_hot_limit_usb_flag = 0;
+		chg->battery_hot_limit_bat_flag = 0;
+		smblib_dbg(chg, PR_INTERRUPT, "usbin-plugout: state=%d, vbus_debounce_count = %d\n",
+			chg->charge_state, chg->vbus_debounce_count);
+		usleep_range(1000,2000);
+		rc = smblib_get_prop_usb_voltage_now(chg, &vol_now);
+		if (rc < 0)
+			smblib_err(chg, "Couldn't read usb voltage rc=%d\n",
+				rc);
+
+		if ((chg->charge_state == CHARGE_2C_MODE) &&
+			(chg->vbus_debounce_count > 0)) {
+			if ((vol_now.intval/1000000) > 0) {
+				smblib_err(chg, "charge plug out debounce state\n");
+				chg->charge_state = CHARGE_PLUG_OUT_DEBOUNCE;
+				chg->vbus_weak = 1;
+			} else {
+				chg->charge_state = NO_CHARGE_MODE;
+				smblib_set_icl_current(chg, 0);
+				/* Reset weak vbus detection*/
+				chg->vbus_weak = 0;
+				chg->vbus_debounce_count = 0;
+				/* Cancel 2c delay work queque */
+				smblib_err(chg, "usb plug out, reset to no charge mode\n");
+				if (chg->aicl_rerun_enable)
+					cancel_delayed_work(&chg->usbicl_rerun_work);
+			}
+		} else {
+			if ((chg->charge_state == CHARGE_1C_MODE) &&
+				((vol_now.intval/1000000) > 0)) {
+				smblib_err(chg, "charge plug out debounce state\n");
+				chg->charge_state = CHARGE_PLUG_OUT_DEBOUNCE;
+				smblib_set_icl_current(chg, 0);
+				chg->vbus_weak = 1;
+			} else {
+				chg->charge_state = NO_CHARGE_MODE;
+				smblib_set_icl_current(chg, 0);
+				/* Reset weak vbus detection*/
+				chg->vbus_weak = 0;
+				chg->vbus_debounce_count = 0;
+				smblib_err(chg, "usb plug out, reset to no charge mode\n");
+				if (chg->aicl_rerun_enable)
+					cancel_delayed_work(&chg->usbicl_rerun_work);
+			}
+		}
+
+		/* Cancel 2c delay work queque */
+		cancel_delayed_work_sync(&chg->charge_2c_status_work);
+		cancel_delayed_work_sync(
+			&chg->charge_2c_weak_charge_state_work);
+
 		if (chg->wa_flags & BOOST_BACK_WA) {
 			data = chg->irq_info[SWITCH_POWER_OK_IRQ].irq_data;
 			if (data) {
@@ -3983,19 +4369,97 @@ static void smblib_force_legacy_icl(struct smb_charger *chg, int pst)
 		vote(chg->usb_icl_votable, LEGACY_UNKNOWN_VOTER, false, 0);
 		break;
 	case POWER_SUPPLY_TYPE_USB_CDP:
-		vote(chg->usb_icl_votable, LEGACY_UNKNOWN_VOTER, true, 1500000);
+		if (chg->bootup_phase == BOOT_UP_DONE) {
+			/* switch charge state to CHARGE_CDP_SDP */
+			if (chg->charge_state != CHARGE_PLUG_OUT_DEBOUNCE)
+				chg->charge_state = CHARGE_CDP_SDP;
+			/*
+			 * Keep current limit 800 mA and charge 1C in 5 seconds
+			 * after that set charge current to 2C
+			 */
+			smblib_err(chg, "CDP charge detected,"
+				" vote ICL to %dmA in first %d seconds\n",
+				USBIN_CDP_DCP_2C/1000, CDP_DCP_DET_MS/1000);
+
+			smblib_set_icl_current(chg, USBIN_CDP_DCP_2C);
+			/*
+			* Sometimes, this function is called twice,
+			* Cancel delay work before starting new work delay
+			*/
+			cancel_delayed_work_sync(&chg->cdp_dcp_detect_work);
+			schedule_delayed_work(&chg->cdp_dcp_detect_work,
+				msecs_to_jiffies(CDP_DCP_DET_MS));
+		} else {
+			/* switch charge state to CHARGE_1C_MODE*/
+			if (chg->charge_state != CHARGE_PLUG_OUT_DEBOUNCE)
+				chg->charge_state = CHARGE_1C_MODE;
+			/*
+			 * set current limit to 350 mA and
+			 * charge 1C in boot up phase
+			 */
+			smblib_err(chg, "CDP charge detected in boot up phase,"
+				" vote ICL to %dmA and keep charge 1C\n",
+				USBIN_CDP_DCP_1C/1000);
+
+			smblib_set_icl_current(chg, USBIN_CDP_DCP_1C);
+		}
 		break;
 	case POWER_SUPPLY_TYPE_USB_DCP:
-		typec_mode = smblib_get_prop_typec_mode(chg);
-		rp_ua = get_rp_based_dcp_current(chg, typec_mode);
-		vote(chg->usb_icl_votable, LEGACY_UNKNOWN_VOTER, true, rp_ua);
+		if (chg->bootup_phase == BOOT_UP_DONE) {
+			/* switch charge state to CHARGE_CDP_SDP*/
+			if (chg->charge_state != CHARGE_PLUG_OUT_DEBOUNCE)
+				chg->charge_state = CHARGE_CDP_SDP;
+			/*
+			 * Keep current limit 350 mA and
+			 * charge 1C in 5 seconds
+			 */
+			smblib_err(chg, "DCP charge detected,"
+				" vote ICL to %dmA in first %d seconds\n",
+				USBIN_CDP_DCP_1C/1000, CDP_DCP_DET_MS/1000);
+
+			smblib_set_icl_current(chg, USBIN_CDP_DCP_1C);
+			/*
+			* Sometimes, this function is called twice,
+			* Cancel delay work before starting new work delay
+			*/
+			chg->vbus_debounce_count = 0;
+			if(chg->vbus_weak == 0) {
+				cancel_delayed_work_sync(
+					&chg->cdp_dcp_detect_work);
+				schedule_delayed_work(
+					&chg->cdp_dcp_detect_work,
+					msecs_to_jiffies(CDP_DCP_DET_MS));
+			} else {
+				smblib_err(chg, "vbus weak detected, keep 1C charge\n");
+				/* vbus is jumping, switch to 1C charge state */
+				chg->charge_state = CHARGE_1C_MODE;
+				chg->vbus_weak = 0;
+				cancel_delayed_work_sync(
+					&chg->cdp_dcp_detect_work);
+			}
+		} else {
+			/* switch charge state to CHARGE_1C_MODE*/
+			if (chg->charge_state != CHARGE_PLUG_OUT_DEBOUNCE)
+				chg->charge_state = CHARGE_1C_MODE;
+			/*
+			 * set current limit to 350 mA and
+			 * charge 1C in boot up phase
+			 */
+			smblib_err(chg, "DCP charge detected in boot up phase,"
+				" vote ICL to %dmA and keep charge 1C\n",
+				USBIN_CDP_DCP_1C/1000);
+
+			smblib_set_icl_current(chg, USBIN_CDP_DCP_1C);
+		}
 		break;
 	case POWER_SUPPLY_TYPE_USB_FLOAT:
 		/*
-		 * limit ICL to 100mA, the USB driver will enumerate to check
+		 * limit ICL to 500mA, the USB driver will enumerate to check
 		 * if this is a SDP and appropriately set the current
 		 */
-		vote(chg->usb_icl_votable, LEGACY_UNKNOWN_VOTER, true, 100000);
+		smblib_err(chg, "FLOAT charge detected, vote ICL to %dmA \n",
+			USBIN_FLOAT/1000);
+		smblib_set_icl_current(chg, USBIN_FLOAT);
 		break;
 	case POWER_SUPPLY_TYPE_USB_HVDCP:
 	case POWER_SUPPLY_TYPE_USB_HVDCP_3:
@@ -4003,7 +4467,8 @@ static void smblib_force_legacy_icl(struct smb_charger *chg, int pst)
 		break;
 	default:
 		smblib_err(chg, "Unknown APSD %d; forcing 500mA\n", pst);
-		vote(chg->usb_icl_votable, LEGACY_UNKNOWN_VOTER, true, 500000);
+		vote(chg->usb_icl_votable, LEGACY_UNKNOWN_VOTER, true,
+			USBIN_FLOAT/1000);
 		break;
 	}
 }
@@ -4324,6 +4789,8 @@ static void typec_sink_insertion(struct smb_charger *chg)
 
 static void typec_sink_removal(struct smb_charger *chg)
 {
+	smblib_set_charge_param(chg, &chg->param.freq_boost,
+			chg->chg_freq.freq_above_otg_threshold);
 	chg->boost_current_ua = 0;
 }
 
@@ -4357,6 +4824,7 @@ static void smblib_handle_typec_removal(struct smb_charger *chg)
 
 	cancel_delayed_work_sync(&chg->pl_enable_work);
 	cancel_delayed_work_sync(&chg->hvdcp_detect_work);
+	cancel_delayed_work_sync(&chg->cdp_dcp_detect_work);
 
 	/* reset input current limit voters */
 	vote(chg->usb_icl_votable, LEGACY_UNKNOWN_VOTER, true, 100000);
@@ -4738,11 +5206,41 @@ irqreturn_t smblib_handle_switcher_power_ok(int irq, void *data)
 		/* This could be a weak charger reduce ICL */
 		if (!is_client_vote_enabled(chg->usb_icl_votable,
 						WEAK_CHARGER_VOTER)) {
-			smblib_err(chg,
-				"Weak charger detected: voting %dmA ICL\n",
-				*chg->weak_chg_icl_ua / 1000);
-			vote(chg->usb_icl_votable, WEAK_CHARGER_VOTER,
-					true, *chg->weak_chg_icl_ua);
+			/* switch charge state to CHARGE_1C_MODE */
+			chg->charge_state = CHARGE_1C_MODE;
+			/*
+			* vote ICL to 350mA if real_charger_type is SDP
+			* vote ICL to 500mA if other charge type weak detected
+			*/
+			if (chg->real_charger_type == POWER_SUPPLY_TYPE_USB) {
+				smblib_err(chg,
+					"SDP Weak charger detected: voting %dmA ICL\n",
+						350);
+				vote(chg->usb_icl_votable, WEAK_CHARGER_VOTER,
+						true, 350000);
+			} else if ((chg->real_charger_type ==
+				POWER_SUPPLY_TYPE_USB_DCP) ||
+				(chg->real_charger_type ==
+					POWER_SUPPLY_TYPE_USB_CDP)) {
+				/*
+				* Note: this is corner case:
+				*  We are in middle of DCP detect work.
+				*  Cancel delay_work, then vote ICL to 350mA
+				*/
+				cancel_delayed_work_sync(
+					&chg->cdp_dcp_detect_work);
+				smblib_err(chg,
+					"DCP/CDP Weak charger detected: voting %dmA ICL\n",
+						350);
+				smblib_set_icl_current(chg, 350000);
+				chg->vbus_debounce_count = 0;
+			} else {
+				smblib_err(chg,
+					"Weak charger detected: voting %dmA ICL\n",
+					*chg->weak_chg_icl_ua / 1000);
+				vote(chg->usb_icl_votable, WEAK_CHARGER_VOTER,
+						true, *chg->weak_chg_icl_ua);
+			}
 			/*
 			 * reset storm data and set the storm threshold
 			 * to 3 for reverse boost detection.
@@ -4760,6 +5258,13 @@ irqreturn_t smblib_handle_switcher_power_ok(int irq, void *data)
 			 */
 			schedule_delayed_work(&chg->bb_removal_work,
 				msecs_to_jiffies(BOOST_BACK_UNVOTE_DELAY_MS));
+
+			if (chg->aicl_rerun_enable) {
+				cancel_delayed_work(&chg->usbicl_rerun_work);
+				usbicl_rerun_time = AICL_RERUN_TIME_3S;
+				schedule_delayed_work(&chg->usbicl_rerun_work,
+						msecs_to_jiffies(2000));
+			}
 		}
 	}
 
@@ -4851,6 +5356,112 @@ static void smblib_hvdcp_detect_work(struct work_struct *work)
 				false, 0);
 	power_supply_changed(chg->usb_psy);
 }
+
+static void smblib_cdp_dcp_detect_work(struct work_struct *work)
+{
+	struct smb_charger *chg = container_of(work,
+		struct smb_charger, cdp_dcp_detect_work.work);
+
+	/* switch charge state to charge 2c */
+	chg->charge_state = CHARGE_2C_MODE;
+
+	/* vote icl to 800 mA*/
+	smblib_err(chg, "vote icl to %dmA\n",
+		USBIN_CDP_DCP_2C/1000);
+
+	if (chg->real_charger_type == POWER_SUPPLY_TYPE_USB_CDP)
+		smblib_update_charge_current(chg);
+	else
+		vote(chg->usb_icl_votable, LEGACY_UNKNOWN_VOTER,
+			true, USBIN_CDP_DCP_2C);
+	/*
+	 * weak charger state detection.
+	 * this works only in 2C mode and vbus = 1.
+	 * But charge staus jumps between charge and discharge
+	 */
+	chg->weak_chg_state_count = 0;
+	schedule_delayed_work(&chg->charge_2c_weak_charge_state_work,
+		msecs_to_jiffies(5000));
+}
+
+
+static void smblib_bootup_2c_work(struct work_struct *work)
+{
+	struct smb_charger *chg = container_of(work,
+		struct smb_charger, bootup_2c_work.work);
+
+	const struct apsd_result *apsd_result = smblib_get_apsd_result(chg);
+
+	chg->bootup_phase = BOOT_UP_DONE;
+	/* Charger is still plugged in */
+	if (chg->vbus_state) {
+		/* If charge type is CDP or DCP, set charge state to 2C*/
+		if (chg->real_charger_type == POWER_SUPPLY_TYPE_USB_DCP) {
+			smblib_err(chg, "vote icl to %dmA\n",
+				USBIN_CDP_DCP_2C/1000);
+			chg->charge_state = CHARGE_2C_MODE;
+			chg->vbus_debounce_count = 0;
+			vote(chg->usb_icl_votable, LEGACY_UNKNOWN_VOTER,
+				true, USBIN_CDP_DCP_2C);
+		} else if (chg->real_charger_type ==
+			POWER_SUPPLY_TYPE_USB_CDP) {
+			smblib_err(chg, "vote icl to %dmA\n",
+				USBIN_CDP_DCP_2C/1000);
+			vote(chg->usb_icl_votable, LEGACY_UNKNOWN_VOTER,
+				true, USBIN_CDP_DCP_2C);
+			chg->charge_state = CHARGE_2C_MODE;
+			smblib_update_charge_current(chg);
+		} else if (chg->real_charger_type == POWER_SUPPLY_TYPE_USB_FLOAT) {
+			vote(chg->usb_icl_votable, LEGACY_UNKNOWN_VOTER,
+				true, USBIN_FLOAT);
+			chg->charge_state = CHARGE_1C_MODE;
+			smblib_err(chg, "keep 1c charge state\n");
+		} else {
+			vote(chg->usb_icl_votable, LEGACY_UNKNOWN_VOTER,
+				true, USBIN_SDP);
+			chg->charge_state = CHARGE_1C_MODE;
+			smblib_err(chg, "keep 1c charge state\n");
+		}
+	} else {
+		smblib_err(chg, "usb plug out, set to no charge\n");
+		chg->charge_state = NO_CHARGE_MODE;
+		smblib_set_icl_current(chg, 0);
+	}
+}
+
+#define WEAK_CHARGE_STATE_THRESHOLD 3
+static void smblib_charge_2c_weak_charge_state_work(struct work_struct *work)
+{
+	struct smb_charger *chg = container_of(work,
+		struct smb_charger,
+		charge_2c_weak_charge_state_work.work);
+
+	if (chg->weak_chg_state_count >= WEAK_CHARGE_STATE_THRESHOLD) {
+		smblib_err(chg,"weak charger detected!! reset to 1C charge\n");
+		chg->charge_state = CHARGE_1C_MODE;
+		smblib_set_icl_current(chg, 350000);
+		chg->vbus_debounce_count = 0;
+	}
+}
+
+#define VBUS_DEBOUNCE_THRESHOLD  3
+static void smblib_charge_2c_status_work(struct work_struct *work)
+{
+	struct smb_charger *chg = container_of(work,
+		struct smb_charger,
+		charge_2c_status_work.work);
+
+	if ((chg->vbus_state == 1) &&
+		(chg->charge_state == CHARGE_2C_MODE)) {
+		if (chg->vbus_debounce_count >= VBUS_DEBOUNCE_THRESHOLD) {
+			smblib_err(chg,"weak charger detected!! reset to 1C charge\n");
+			chg->charge_state = CHARGE_1C_MODE;
+			smblib_set_icl_current(chg, 350000);
+			chg->vbus_debounce_count = 0;
+		}
+	}
+}
+
 
 static void bms_update_work(struct work_struct *work)
 {
@@ -5211,6 +5822,30 @@ unlock:
 	mutex_unlock(&chg->lock);
 }
 
+static void smblib_usbicl_rerun_work(struct work_struct *work)
+{
+	struct smb_charger *chg = container_of(work, struct smb_charger,
+							usbicl_rerun_work.work);
+	int rc = -EINVAL;
+
+	pr_err("Set AICL rerun timer to %s\n",
+	usbicl_rerun_time_text[usbicl_rerun_time]);
+
+	rc = smblib_masked_write(chg, AICL_RERUN_TIME_CFG_REG,
+		AICL_RERUN_TIME_MASK, usbicl_rerun_time);
+	if (rc < 0) {
+		pr_err("Couldn't config AICL rerun time\n");
+		return;
+	}
+
+	if (usbicl_rerun_time == AICL_RERUN_TIME_3S) {
+		//delay 90s then set to rerun time to 12s
+		schedule_delayed_work(&chg->usbicl_rerun_work,
+			msecs_to_jiffies(90000));
+		usbicl_rerun_time = AICL_RERUN_TIME_12S;
+	}
+}
+
 static int smblib_create_votables(struct smb_charger *chg)
 {
 	int rc = 0;
@@ -5424,6 +6059,15 @@ int smblib_init(struct smb_charger *chg)
 	INIT_WORK(&chg->pl_update_work, pl_update_work);
 	INIT_WORK(&chg->rdstd_cc2_detach_work, rdstd_cc2_detach_work);
 	INIT_DELAYED_WORK(&chg->hvdcp_detect_work, smblib_hvdcp_detect_work);
+	INIT_DELAYED_WORK(&chg->cdp_dcp_detect_work,
+		smblib_cdp_dcp_detect_work);
+	INIT_DELAYED_WORK(&chg->charge_2c_weak_charge_state_work,
+		smblib_charge_2c_weak_charge_state_work);
+        INIT_DELAYED_WORK(&chg->usbicl_rerun_work,
+		smblib_usbicl_rerun_work);
+
+	INIT_DELAYED_WORK(&chg->charge_2c_status_work,
+		smblib_charge_2c_status_work);
 	INIT_DELAYED_WORK(&chg->clear_hdc_work, clear_hdc_work);
 	INIT_WORK(&chg->otg_oc_work, smblib_otg_oc_work);
 	INIT_WORK(&chg->vconn_oc_work, smblib_vconn_oc_work);
@@ -5433,10 +6077,27 @@ int smblib_init(struct smb_charger *chg)
 	INIT_WORK(&chg->legacy_detection_work, smblib_legacy_detection_work);
 	INIT_DELAYED_WORK(&chg->uusb_otg_work, smblib_uusb_otg_work);
 	INIT_DELAYED_WORK(&chg->bb_removal_work, smblib_bb_removal_work);
+	INIT_DELAYED_WORK(&chg->bootup_2c_work, smblib_bootup_2c_work);
 	chg->fake_capacity = -EINVAL;
 	chg->fake_input_current_limited = -EINVAL;
 	chg->fake_batt_status = -EINVAL;
-
+	chg->charge_state = 0;
+	chg->vbus_debounce_count = 0;
+	chg->vbus_weak = 0;
+	chg->weak_chg_state_count = 0;
+	chg->last_use_usbin = 0;
+	chg->vbus_state = 0;
+	chg->bootup_phase = BOOT_UP;
+	chg->battery_hot_limit_bat_flag = 0;
+	chg->battery_hot_limit_ibat = 0;
+	chg->battery_hot_limit_usb_flag = 0;
+	chg->chg_status = 0;
+	chg->batt_capacity  = 0;
+	chg->saved_iusb = 0;
+	chg->saved_temp = 0;
+	/* Wait boot-up for 90 seconds */
+	schedule_delayed_work(&chg->bootup_2c_work,
+		msecs_to_jiffies(90000));
 	switch (chg->mode) {
 	case PARALLEL_MASTER:
 		rc = qcom_batt_init(&chg->chg_param);
@@ -5497,6 +6158,7 @@ int smblib_deinit(struct smb_charger *chg)
 		cancel_work_sync(&chg->pl_update_work);
 		cancel_work_sync(&chg->rdstd_cc2_detach_work);
 		cancel_delayed_work_sync(&chg->hvdcp_detect_work);
+		cancel_delayed_work_sync(&chg->cdp_dcp_detect_work);
 		cancel_delayed_work_sync(&chg->clear_hdc_work);
 		cancel_work_sync(&chg->otg_oc_work);
 		cancel_work_sync(&chg->vconn_oc_work);

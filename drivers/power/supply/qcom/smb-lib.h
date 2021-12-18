@@ -307,6 +307,10 @@ struct smb_charger {
 	struct work_struct	pl_update_work;
 	struct work_struct	rdstd_cc2_detach_work;
 	struct delayed_work	hvdcp_detect_work;
+	struct delayed_work	usbicl_rerun_work;
+	struct delayed_work	cdp_dcp_detect_work;
+	struct delayed_work	charge_2c_weak_charge_state_work;
+	struct delayed_work	charge_2c_status_work;
 	struct delayed_work	ps_change_timeout_work;
 	struct delayed_work	clear_hdc_work;
 	struct work_struct	otg_oc_work;
@@ -317,7 +321,7 @@ struct smb_charger {
 	struct work_struct	legacy_detection_work;
 	struct delayed_work	uusb_otg_work;
 	struct delayed_work	bb_removal_work;
-
+	struct delayed_work	bootup_2c_work;
 	/* cached status */
 	int			voltage_min_uv;
 	int			voltage_max_uv;
@@ -370,7 +374,22 @@ struct smb_charger {
 	int			qc2_max_pulses;
 	bool			non_compliant_chg_detected;
 	bool			reddragon_ipc_wa;
-
+	int 			charge_state;
+	int 			vbus_debounce_count;
+	int 			last_use_usbin;
+	int 			weak_chg_state_count;
+	int 			vbus_state;
+	int 			vbus_weak;
+	int 			bootup_phase;
+	int 			charge_1c_ma;
+	bool			battery_hot_limit_bat_flag;
+	int				battery_hot_limit_ibat;
+	bool			battery_hot_limit_usb_flag;
+	int				chg_status;
+	int				batt_capacity;
+	int				saved_iusb;
+	int				saved_temp;
+	bool			aicl_rerun_enable;
 	/* extcon for VBUS / ID notification to USB for uUSB */
 	struct extcon_dev	*extcon;
 
