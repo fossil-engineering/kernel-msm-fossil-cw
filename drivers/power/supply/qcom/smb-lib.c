@@ -2211,7 +2211,7 @@ int smblib_get_jeita_status(struct smb_charger *chg)
 #define BATTERY_HOT_LIMIT_IBAT 125000
 static const struct temp_vs_current temp_vs_current_table[] = {
 	{ 18, 600000 },
-	{ 30, 550000 },  //25 environment temp
+	{ 30, 600000 },  //25 environment temp
 	{ 35, 450000 },
 	{ 40, 350000 },
 	{ 45, 300000 },
