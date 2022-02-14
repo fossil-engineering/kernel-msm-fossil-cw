@@ -10,6 +10,7 @@
  * GNU General Public License for more details.
  */
 
+#include <linux/time.h>
 #include <linux/device.h>
 #include <linux/regmap.h>
 #include <linux/delay.h>
@@ -2209,6 +2210,8 @@ int smblib_get_jeita_status(struct smb_charger *chg)
 #define CHG_STEP_CURRENT 25000
 #define BATTERY_LIMIT_DISABLE_TEMP 38
 #define BATTERY_HOT_LIMIT_IBAT 125000
+#define DELTA_TEMP_TIME_S 5
+
 static const struct temp_vs_current temp_vs_current_table[] = {
 	{ 18, 600000 },
 	{ 30, 600000 },  //25 environment temp
@@ -2236,6 +2239,7 @@ void smblib_temp_vs_current_one_time(struct smb_charger *chg,
 	chg->temp_vs_current_ibat = temp_vs_current_table[chg->temp_vs_current_state].ibat;
 	pr_info("one time battery temp: %d, limit battery current %dmA\n",
 		batt_temp, chg->temp_vs_current_ibat/1000);
+	chg->last_delta_temp_time = get_seconds();
 	smblib_update_charge_current(chg);
 }
 void smblib_battery_hot_limit_current(struct smb_charger *chg,
@@ -2244,6 +2248,8 @@ void smblib_battery_hot_limit_current(struct smb_charger *chg,
 	int rc;
 	int jeita_state, usb_current;
 	u8 data;
+	s64 time_s;
+	s64 time_delta_s;
 
 	//Reset ibat to original value:
 	//(1) battery is 100% and full
@@ -2268,6 +2274,19 @@ void smblib_battery_hot_limit_current(struct smb_charger *chg,
 				smblib_temp_vs_current_one_time(chg, batt_temp);
 			}
 		}
+
+		if(batt_temp > 45 && chg->temp_vs_current_ibat_flag && chg->temp_vs_current_ibat > 300000) {
+			time_s = get_seconds();
+			time_delta_s = time_s - chg->last_delta_temp_time;
+			if (time_delta_s > DELTA_TEMP_TIME_S) {
+				chg->last_delta_temp_time = get_seconds();
+				chg->temp_vs_current_ibat = chg->temp_vs_current_ibat - 25000;
+				pr_info("battery temp over 45 deg: %d, limit battery current %dmA, last_delta_temp_time %lld\n",
+					batt_temp, chg->temp_vs_current_ibat/1000, chg->last_delta_temp_time);
+				smblib_update_charge_current(chg);
+			}
+		}
+
 		//limit usb current
 		if (!chg->battery_hot_limit_usb_flag &&
 			chg->chg_status == POWER_SUPPLY_STATUS_FULL &&

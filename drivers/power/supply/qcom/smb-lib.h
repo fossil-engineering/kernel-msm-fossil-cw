@@ -405,6 +405,8 @@ struct smb_charger {
 	int			pulse_cnt;
 
 	int			die_health;
+
+	s64			last_delta_temp_time;
 };
 
 int smblib_read(struct smb_charger *chg, u16 addr, u8 *val);
