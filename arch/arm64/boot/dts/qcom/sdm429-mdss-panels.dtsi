@@ -46,7 +46,6 @@
 	qcom,mdss-dsi-panel-status-check-mode = "te_signal_check";
 	qcom,mdss-dsi-power-off-disable;
 	qcom,mdss-dsi-tear-disable;
-	qcom,mdss-skip-panel-reset;
 };
 
 &dsi_truly_rm69090_qvga_cmd_v2 {
