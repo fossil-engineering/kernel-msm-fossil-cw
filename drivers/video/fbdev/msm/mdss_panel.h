@@ -950,9 +950,12 @@ struct mdss_panel_info {
 	 * Set for some in-cell panels
 	 */
 	bool skip_panel_reset;
+	bool pwr_off_disable;
 
 	/* HDR properties of display panel*/
 	struct mdss_panel_hdr_properties hdr_properties;
+
+	bool tear_disable;
 
 	/* esc clk recommended for the panel */
 	u32 esc_clk_rate_hz;
