@@ -963,7 +963,8 @@ int pll_vco_prepare_12nm(struct clk_hw *hw)
 
 	/* Skip vco recalculation for continuous splash use case */
 	if (pll->handoff_resources) {
-		pr_debug("%s: Skip recalculation during cont splash\n",__func__);
+		pr_debug("%s: Skip recalculation during cont splash\n",
+						__func__);
 		return rc;
 	}
 
