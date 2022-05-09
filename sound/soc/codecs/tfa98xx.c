@@ -68,9 +68,17 @@ static nxpTfaContainer_t *tfa98xx_container;
 static int tfa98xx_kmsg_regs;
 static int tfa98xx_ftrace_regs;
 
-static char *fw_name = "tfa98xx.cnt";
-module_param(fw_name, charp, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(fw_name, "TFA98xx DSP firmware (container file) name.");
+extern char *saved_command_line;
+
+char *fw_name;
+static char *fw_name_tfa98xx = "tfa98xx.cnt";
+static char *fw_name_tfa9890 = "tfa9890.cnt";
+
+module_param(fw_name_tfa98xx, charp, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(fw_name_tfa98xx, "TFA98xx DSP firmware (container file) name.");
+
+module_param(fw_name_tfa9890, charp, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(fw_name_tfa9890, "TFA9890 DSP firmware (container file) name.");
 
 static int trace_level;
 module_param(trace_level, int, S_IRUGO);
@@ -2302,7 +2310,28 @@ static void tfa98xx_resume_container_loaded(const struct firmware *cont,
 
 static int tfa98xx_load_container(struct tfa98xx *tfa98xx)
 {
+	bool device_use_tfa98xx = true; /* default hw use tfa98xx*/
 	tfa98xx->dsp_fw_state = TFA98XX_DSP_FW_PENDING;
+
+	char audio_status[6] = {'\0'};
+	char *match = (char *)strnstr(saved_command_line,
+				      "androidboot.audio.use_tfa9897=",
+				      strlen(saved_command_line));
+
+	if (match) {
+		pr_info("%s found audio agrs, parsing condition...", __func__);
+		memcpy(audio_status, (match + strlen("androidboot.audio.use_tfa9897=")),
+			sizeof(audio_status) - 1);
+		if (strnstr(audio_status, "false", strlen(audio_status)))
+			device_use_tfa98xx = false;
+	}
+
+	if (device_use_tfa98xx) {
+		fw_name = fw_name_tfa98xx;
+	} else {
+		fw_name = fw_name_tfa9890;
+	}
+	pr_info("%s load device audio fw name: %s",__func__, fw_name);
 
 	return request_firmware_nowait(THIS_MODULE, FW_ACTION_HOTPLUG,
 		fw_name, tfa98xx->dev, GFP_KERNEL,
