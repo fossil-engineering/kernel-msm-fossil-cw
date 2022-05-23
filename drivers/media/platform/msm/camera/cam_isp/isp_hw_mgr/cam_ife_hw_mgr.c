@@ -925,9 +925,12 @@ static int cam_ife_hw_mgr_acquire_res_ife_out_rdi(
 		out_port = &in_port->data[i];
 
 
-		if ((vfe_out_res_id != out_port->res_type) &&
+		if (((vfe_out_res_id != out_port->res_type) &&
 			((vfe_out_res_id < CAM_ISP_IFE_OUT_RES_RDI_0) ||
-			(vfe_out_res_id > CAM_ISP_IFE_OUT_RES_RDI_3)))
+			(vfe_out_res_id > CAM_ISP_IFE_OUT_RES_RDI_3))) ||
+			((out_port->res_type < CAM_ISP_IFE_OUT_RES_RDI_0) ||
+			(out_port->res_type > CAM_ISP_IFE_OUT_RES_RDI_3)))
+
 			continue;
 
 		out_port->res_type = vfe_out_res_id;
@@ -1871,7 +1874,7 @@ static int cam_ife_hw_mgr_acquire_res_ife_csid_rdi(
 			CAM_ISP_RESOURCE_PIX_PATH;
 		csid_res->res_id = csid_acquire.res_id;
 
-		*acq_res_id = ((uint32_t)csid_acquire.res_id) <<
+		*acq_res_id |= ((uint32_t)csid_acquire.res_id) <<
 						(16 + org_path_res_id*2);
 		*acq_res_id |= 1 << (csid_acquire.res_id + 3);
 		csid_res->is_dual_vfe = 0;
