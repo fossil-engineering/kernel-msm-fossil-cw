@@ -69,18 +69,10 @@ enum tfa_reset_polarity{
 	LOW = 0,
 	HIGH = 1
 };
-
-struct dvdd_supply {
-	struct regulator *dvdd;
-	int min_uv;
-	int max_uv;
-	int ua;
-};
-
 struct tfa98xx {
 	struct regmap *regmap;
 	struct i2c_client *i2c;
-	struct dvdd_supply supply;
+	struct regulator *vdd;
 	struct snd_soc_codec *codec;
 	struct workqueue_struct *tfa98xx_wq;
 	struct delayed_work init_work;
