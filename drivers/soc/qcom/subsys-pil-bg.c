@@ -308,8 +308,10 @@ static int bg_powerup(const struct subsys_desc *subsys)
 			"%s: BG PIL Boot failed\n", __func__);
 		dev_err(bg_data->desc.dev,
                         "%s: Fossil: workaround for Dim screen\n", __func__);
-		sys_sync();
-                kernel_restart(NULL);
+
+		/* Hard reset system */
+		emergency_restart();
+
 		return ret;
 	}
 	ret = wait_for_err_ready(bg_data);
