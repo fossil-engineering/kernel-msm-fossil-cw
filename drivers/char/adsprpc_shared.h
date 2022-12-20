@@ -302,6 +302,15 @@ struct smq_invoke_rsp {
 	int retval;	             /* invoke return value */
 };
 
+enum fastrpc_process_create_state {
+	/* Process is not created */
+	PROCESS_CREATE_DEFAULT			= 0,
+	/* Process creation is in progress */
+	PROCESS_CREATE_IS_INPROGRESS	= 1,
+	/* Process creation is successful */
+	PROCESS_CREATE_SUCCESS			= 2,
+};
+
 static inline struct smq_invoke_buf *smq_invoke_buf_start(remote_arg64_t *pra,
 							uint32_t sc)
 {
